@@ -2071,58 +2071,30 @@ async def on_message(message):
                 ping = role.mention if role else ""
                 custom_text = cfg.get("text", "").strip()
 
-                # ── Always send a rich embed, custom text goes inside it ──
+                # Bottom text: use custom if set, otherwise the default
                 if custom_text:
-                    main_desc = custom_text.replace("{user}", message.author.mention)
+                    bottom = custom_text.replace("{user}", message.author.mention)
                 else:
-                    main_desc = (
-                        f"تکایە بچنە کەناڵەکەی و وەڵامی بدەنەوە.\n"
-                        f"Please go to their channel and respond."
+                    bottom = (
+                        "تکایە بچنە کەناڵەکەی و وەڵامی بدەنەوە.\n"
+                        "Please go to their channel and help them."
                     )
 
                 notify = discord.Embed(
                     color=0xF59E0B,
                     title="📣 داوای ریکلامی نوێ | New Reklam Request",
-                    description=main_desc,
+                    description=(
+                        f"**کەسی داواکار | Requester:** {message.author.mention}\n"
+                        f"**کەناڵ | Channel:** {message.channel.mention}\n\n"
+                        f"{bottom}\n\n"
+                        f"**کات | Time:** <t:{int(message.created_at.timestamp())}:R>"
+                    ),
                     timestamp=datetime.datetime.utcnow(),
                 )
-                notify.add_field(
-                    name="👤 داواکار | Requester",
-                    value=f"{message.author.mention}\n`{message.author}`",
-                    inline=True,
-                )
-                notify.add_field(
-                    name="💬 کەناڵ | Channel",
-                    value=message.channel.mention,
-                    inline=True,
-                )
-                notify.add_field(
-                    name="⏰ کات | Time",
-                    value=f"<t:{int(message.created_at.timestamp())}:R>",
-                    inline=True,
-                )
-                notify.set_author(
-                    name=f"{message.author.display_name} داوای ریکلامی کرد | requested a reklam",
-                    icon_url=message.author.display_avatar.url,
-                )
                 notify.set_thumbnail(url=message.author.display_avatar.url)
-                notify.set_footer(
-                    text=message.guild.name,
-                    icon_url=message.guild.icon.url if message.guild.icon else None,
-                )
-
-                # Button to jump straight to their channel
-                class _GoBtn(discord.ui.View):
-                    def __init__(self):
-                        super().__init__(timeout=None)
-                        self.add_item(discord.ui.Button(
-                            label="🔗 بچۆ بۆ کەناڵ | Go to Channel",
-                            url=f"https://discord.com/channels/{message.guild.id}/{message.channel.id}",
-                            style=discord.ButtonStyle.link,
-                        ))
-
+                notify.set_footer(text=message.guild.name)
                 try:
-                    await ch.send(content=ping if ping else None, embed=notify, view=_GoBtn())
+                    await ch.send(content=ping if ping else None, embed=notify)
                 except (discord.Forbidden, discord.HTTPException):
                     pass
         return
