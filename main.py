@@ -342,6 +342,11 @@ def _migrate_db():
     migrations = [
         "ALTER TABLE welcome_embed_settings ADD COLUMN channel_id TEXT DEFAULT ''",
         "ALTER TABLE perk_settings ADD COLUMN description TEXT DEFAULT ''",
+        "ALTER TABLE reklam_settings ADD COLUMN text TEXT DEFAULT ''",
+        """CREATE TABLE IF NOT EXISTS invite_custom_text (
+            guild_id INTEGER PRIMARY KEY,
+            text TEXT DEFAULT ''
+        )""",
     ]
     for sql in migrations:
         try:
@@ -1141,11 +1146,11 @@ def save_done_log_channel(guild_id: int, channel_id: int):
 def get_reklam_settings(guild_id: int):
     conn = get_db()
     row = conn.execute(
-        "SELECT channel_id, role_id FROM reklam_settings WHERE guild_id=?", (guild_id,)
+        "SELECT channel_id, role_id, text FROM reklam_settings WHERE guild_id=?", (guild_id,)
     ).fetchone()
     conn.close()
     if row:
-        return {"channel_id": row["channel_id"], "role_id": row["role_id"]}
+        return {"channel_id": row["channel_id"], "role_id": row["role_id"], "text": row["text"] or ""}
     return None
 
 
@@ -1155,6 +1160,40 @@ def save_reklam_settings(guild_id: int, channel_id: int, role_id: int):
         "INSERT INTO reklam_settings (guild_id, channel_id, role_id) VALUES (?,?,?) "
         "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, role_id=excluded.role_id",
         (guild_id, channel_id, role_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_reklam_text(guild_id: int, text: str):
+    """Save custom reklam notification text (supports {user} placeholder)."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO reklam_settings (guild_id, text) VALUES (?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET text=excluded.text",
+        (guild_id, text)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_invite_custom_text(guild_id: int) -> str:
+    """Get custom invite announcement text for this guild."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT text FROM invite_custom_text WHERE guild_id=?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row["text"] if row else ""
+
+
+def save_invite_custom_text(guild_id: int, text: str):
+    """Save custom invite announcement text for this guild."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO invite_custom_text (guild_id, text) VALUES (?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET text=excluded.text",
+        (guild_id, text)
     )
     conn.commit()
     conn.close()
@@ -2030,24 +2069,34 @@ async def on_message(message):
             role = message.guild.get_role(cfg["role_id"])
             if ch:
                 ping = role.mention if role else ""
-                notify = discord.Embed(
-                    color=0xF59E0B,
-                    title="📣 داوای ریکلامی نوێ | New Reklam Request",
-                    description=(
-                        f"**کەسی داواکار | Requester:** {message.author.mention} (`{message.author}`)\n"
-                        f"**کەناڵ | Channel:** {message.channel.mention}\n"
-                        f"**کات | Time:** <t:{int(message.created_at.timestamp())}:R>\n\n"
-                        "تکایە بچنە کەناڵەکەی و وەڵامی بدەنەوە.\n"
-                        "Please go to their channel and help them."
-                    ),
-                    timestamp=datetime.datetime.utcnow(),
-                )
-                notify.set_thumbnail(url=message.author.display_avatar.url)
-                notify.set_footer(text=message.guild.name)
-                try:
-                    await ch.send(content=ping if ping else None, embed=notify)
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+                custom_text = cfg.get("text", "").strip()
+                if custom_text:
+                    # Replace {user} with the mention of whoever typed "reklam"
+                    final_msg = custom_text.replace("{user}", message.author.mention)
+                    send_content = (ping + "\n" + final_msg) if ping else final_msg
+                    try:
+                        await ch.send(content=send_content)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                else:
+                    notify = discord.Embed(
+                        color=0xF59E0B,
+                        title="📣 داوای ریکلامی نوێ | New Reklam Request",
+                        description=(
+                            f"**کەسی داواکار | Requester:** {message.author.mention} (`{message.author}`)\n"
+                            f"**کەناڵ | Channel:** {message.channel.mention}\n"
+                            f"**کات | Time:** <t:{int(message.created_at.timestamp())}:R>\n\n"
+                            "تکایە بچنە کەناڵەکەی و وەڵامی بدەنەوە.\n"
+                            "Please go to their channel and help them."
+                        ),
+                        timestamp=datetime.datetime.utcnow(),
+                    )
+                    notify.set_thumbnail(url=message.author.display_avatar.url)
+                    notify.set_footer(text=message.guild.name)
+                    try:
+                        await ch.send(content=ping if ping else None, embed=notify)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
         return
 
     # --- NO-PREFIX TAG TRIGGER ---
@@ -3658,6 +3707,7 @@ async def setinviteembed(ctx, channel: discord.TextChannel = None):
     target = channel or ctx.channel
     invite_channels[str(ctx.guild.id)] = target.id
     save_invite_channels()
+    current_text = get_invite_custom_text(ctx.guild.id)
     embed = discord.Embed(
         color=0x57F287,
         title="✅ کەناڵی بانگهێشتکردن دانراو! | Invite Channel Set!",
@@ -3669,8 +3719,10 @@ async def setinviteembed(ctx, channel: discord.TextChannel = None):
     )
     embed.add_field(name="📋 فەرمانەکانی تر | Other Commands",
                     value="`!invites [@member]` · `!invitetop` · `!removeinviteembed`", inline=False)
+    if current_text:
+        embed.add_field(name="✏️ دەقی ئێستا | Current Custom Text", value=f"```{current_text[:200]}```", inline=False)
     embed.set_footer(text=f"Set by {ctx.author.display_name}")
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, view=InviteSetupView(ctx.guild.id))
 
 @bot.command(name="removeinviteembed", aliases=["unsetinvite", "removeinvite"])
 @commands.has_permissions(manage_guild=True)
@@ -11337,6 +11389,80 @@ async def staff_remove_channel(ctx):
 
 # ═══════════════════════ REKLAM SYSTEM ═══════════════════════
 
+# ─── Reklam Text Modal ───────────────────────────────────────────────────────
+class ReklamTextModal(discord.ui.Modal, title="✏️ Edit Reklam Text | دەقی ریکلام"):
+    text_input = discord.ui.TextInput(
+        label="Edit Text  (use {user} to tag the requester)",
+        placeholder="📣 {user} داوای ریکلامی کرد! | requested a reklam slot!",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        save_reklam_text(interaction.guild.id, self.text_input.value)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                color=0x57F287,
+                title="✅ دەقی ریکلام نوێکرایەوە | Reklam Text Updated",
+                description=(
+                    f"**دەقی نوێ | New Text:**\n```{self.text_input.value}```\n\n"
+                    "ئیستا `{user}` دەگۆڕدرێت بە ئەو کەسەی داوای ریکلامی کردووە.\n"
+                    "Now `{user}` will be replaced with the mention of whoever types `reklam`."
+                ),
+            ),
+            ephemeral=True,
+        )
+
+
+# ─── Invite Text Modal ───────────────────────────────────────────────────────
+class InviteTextModal(discord.ui.Modal, title="✏️ Edit Invite Text | دەقی بانگهێشت"):
+    text_input = discord.ui.TextInput(
+        label="Edit Text",
+        placeholder="🎉 Welcome {user}! Invited by {inviter} · {count} invites total",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        save_invite_custom_text(interaction.guild.id, self.text_input.value)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                color=0x57F287,
+                title="✅ دەقی بانگهێشت نوێکرایەوە | Invite Text Updated",
+                description=(
+                    f"**دەقی نوێ | New Text:**\n```{self.text_input.value}```\n\n"
+                    "**Placeholders you can use:**\n"
+                    "`{user}` — new member mention\n"
+                    "`{inviter}` — who invited them\n"
+                    "`{count}` — inviter's total invites"
+                ),
+            ),
+            ephemeral=True,
+        )
+
+
+# ─── Invite Setup View ───────────────────────────────────────────────────────
+class InviteSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="✏️ Edit Text", style=discord.ButtonStyle.primary)
+    async def edit_text_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message(
+                "❌ مووچەی Manage Server پێویستە. | You need Manage Server permission.", ephemeral=True
+            )
+        modal = InviteTextModal()
+        current = get_invite_custom_text(self.guild_id)
+        if current:
+            modal.text_input.default = current
+        await interaction.response.send_modal(modal)
+
+
+# ─── Reklam Setup View ───────────────────────────────────────────────────────
 class ReklamSetupView(discord.ui.View):
     """Interactive setup for !setreklam — pick channel then role."""
     def __init__(self, ctx):
@@ -11415,6 +11541,19 @@ class ReklamSetupView(discord.ui.View):
             view=self,
         )
         self.stop()
+
+    @discord.ui.button(
+        label="✏️ Edit Text",
+        style=discord.ButtonStyle.secondary,
+        row=3,
+    )
+    async def edit_text_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Open a modal to set a custom reklam notification message. Use {user} to tag the requester."""
+        modal = ReklamTextModal()
+        current = get_reklam_settings(interaction.guild.id)
+        if current and current.get("text"):
+            modal.text_input.default = current["text"]
+        await interaction.response.send_modal(modal)
 
 
 @bot.command(name="setreklam", aliases=["reklamsetup", "setupreklam"])
