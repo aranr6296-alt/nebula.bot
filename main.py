@@ -2070,33 +2070,61 @@ async def on_message(message):
             if ch:
                 ping = role.mention if role else ""
                 custom_text = cfg.get("text", "").strip()
+
+                # ── Always send a rich embed, custom text goes inside it ──
                 if custom_text:
-                    # Replace {user} with the mention of whoever typed "reklam"
-                    final_msg = custom_text.replace("{user}", message.author.mention)
-                    send_content = (ping + "\n" + final_msg) if ping else final_msg
-                    try:
-                        await ch.send(content=send_content)
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
+                    main_desc = custom_text.replace("{user}", message.author.mention)
                 else:
-                    notify = discord.Embed(
-                        color=0xF59E0B,
-                        title="📣 داوای ریکلامی نوێ | New Reklam Request",
-                        description=(
-                            f"**کەسی داواکار | Requester:** {message.author.mention} (`{message.author}`)\n"
-                            f"**کەناڵ | Channel:** {message.channel.mention}\n"
-                            f"**کات | Time:** <t:{int(message.created_at.timestamp())}:R>\n\n"
-                            "تکایە بچنە کەناڵەکەی و وەڵامی بدەنەوە.\n"
-                            "Please go to their channel and help them."
-                        ),
-                        timestamp=datetime.datetime.utcnow(),
+                    main_desc = (
+                        f"تکایە بچنە کەناڵەکەی و وەڵامی بدەنەوە.\n"
+                        f"Please go to their channel and respond."
                     )
-                    notify.set_thumbnail(url=message.author.display_avatar.url)
-                    notify.set_footer(text=message.guild.name)
-                    try:
-                        await ch.send(content=ping if ping else None, embed=notify)
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
+
+                notify = discord.Embed(
+                    color=0xF59E0B,
+                    title="📣 داوای ریکلامی نوێ | New Reklam Request",
+                    description=main_desc,
+                    timestamp=datetime.datetime.utcnow(),
+                )
+                notify.add_field(
+                    name="👤 داواکار | Requester",
+                    value=f"{message.author.mention}\n`{message.author}`",
+                    inline=True,
+                )
+                notify.add_field(
+                    name="💬 کەناڵ | Channel",
+                    value=message.channel.mention,
+                    inline=True,
+                )
+                notify.add_field(
+                    name="⏰ کات | Time",
+                    value=f"<t:{int(message.created_at.timestamp())}:R>",
+                    inline=True,
+                )
+                notify.set_author(
+                    name=f"{message.author.display_name} داوای ریکلامی کرد | requested a reklam",
+                    icon_url=message.author.display_avatar.url,
+                )
+                notify.set_thumbnail(url=message.author.display_avatar.url)
+                notify.set_footer(
+                    text=message.guild.name,
+                    icon_url=message.guild.icon.url if message.guild.icon else None,
+                )
+
+                # Button to jump straight to their channel
+                class _GoBtn(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=None)
+                        self.add_item(discord.ui.Button(
+                            label="🔗 بچۆ بۆ کەناڵ | Go to Channel",
+                            url=f"https://discord.com/channels/{message.guild.id}/{message.channel.id}",
+                            style=discord.ButtonStyle.link,
+                        ))
+
+                try:
+                    await ch.send(content=ping if ping else None, embed=notify, view=_GoBtn())
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
         return
 
     # --- NO-PREFIX TAG TRIGGER ---
