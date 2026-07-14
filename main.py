@@ -330,6 +330,38 @@ def init_db():
             guild_id   INTEGER PRIMARY KEY,
             message_id INTEGER
         );
+        CREATE TABLE IF NOT EXISTS afk_settings (
+            guild_id   INTEGER PRIMARY KEY,
+            go_text    TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS staff_daily_text (
+            guild_id    INTEGER PRIMARY KEY,
+            title       TEXT DEFAULT '',
+            description TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS antiswear_settings (
+            guild_id INTEGER PRIMARY KEY,
+            enabled  INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS antiswear_words (
+            guild_id INTEGER,
+            word     TEXT,
+            PRIMARY KEY (guild_id, word)
+        );
+        CREATE TABLE IF NOT EXISTS antiswear_channels (
+            guild_id   INTEGER,
+            channel_id INTEGER,
+            PRIMARY KEY (guild_id, channel_id)
+        );
+        CREATE TABLE IF NOT EXISTS antilink_settings (
+            guild_id INTEGER PRIMARY KEY,
+            enabled  INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS antilink_channels (
+            guild_id   INTEGER,
+            channel_id INTEGER,
+            PRIMARY KEY (guild_id, channel_id)
+        );
     """)
     conn.commit()
     conn.close()
@@ -387,6 +419,12 @@ _DEFAULT_APPLY_QUESTIONS = [
 ]
 log_channels   = {}  # {guild_id: channel_id}
 anti_link_guilds = {}  # {guild_id: True/False}  — anti-link toggle per server
+antilink_channels_map = {}  # {guild_id: set(channel_id, ...)}  — channels antilink is scoped to (empty = all channels)
+antiswear_guilds = {}  # {guild_id: True/False}  — anti-swear toggle per server
+antiswear_words_map = {}  # {guild_id: set(word, ...)}  — banned words per server
+antiswear_channels_map = {}  # {guild_id: set(channel_id, ...)}  — channels antiswear is scoped to (empty = all channels)
+afk_go_text_map = {}  # {guild_id: custom "gone AFK" sentence template}
+staff_daily_text_map = {}  # {guild_id: {"title": str, "description": str}}
 staff_daily_channels = {}  # {guild_id: channel_id}  — where daily ping is sent
 staff_daily_roles_map = {}  # {guild_id: [role_id, ...]}  — roles to ping
 level_enabled = {}
@@ -1276,6 +1314,149 @@ def save_afk():
     conn.commit()
     conn.close()
 
+def load_afk_go_text():
+    global afk_go_text_map
+    afk_go_text_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, go_text FROM afk_settings"):
+        afk_go_text_map[str(row["guild_id"])] = row["go_text"] or ""
+    conn.close()
+
+def save_afk_go_text(guild_id, go_text):
+    gid = str(guild_id)
+    afk_go_text_map[gid] = go_text
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO afk_settings (guild_id, go_text) VALUES (?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET go_text=excluded.go_text",
+        (int(gid), go_text)
+    )
+    conn.commit()
+    conn.close()
+
+def load_staff_daily_text():
+    global staff_daily_text_map
+    staff_daily_text_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, title, description FROM staff_daily_text"):
+        staff_daily_text_map[str(row["guild_id"])] = {
+            "title": row["title"] or "", "description": row["description"] or ""
+        }
+    conn.close()
+
+def save_staff_daily_text(guild_id, title, description):
+    gid = str(guild_id)
+    staff_daily_text_map[gid] = {"title": title, "description": description}
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO staff_daily_text (guild_id, title, description) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET title=excluded.title, description=excluded.description",
+        (int(gid), title, description)
+    )
+    conn.commit()
+    conn.close()
+
+def load_antilink_settings():
+    global anti_link_guilds, antilink_channels_map
+    anti_link_guilds = {}
+    antilink_channels_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, enabled FROM antilink_settings"):
+        anti_link_guilds[str(row["guild_id"])] = bool(row["enabled"])
+    for row in conn.execute("SELECT guild_id, channel_id FROM antilink_channels"):
+        antilink_channels_map.setdefault(str(row["guild_id"]), set()).add(row["channel_id"])
+    conn.close()
+
+def save_antilink_enabled(guild_id, enabled: bool):
+    gid = str(guild_id)
+    anti_link_guilds[gid] = enabled
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO antilink_settings (guild_id, enabled) VALUES (?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET enabled=excluded.enabled",
+        (int(gid), 1 if enabled else 0)
+    )
+    conn.commit()
+    conn.close()
+
+def toggle_antilink_channel(guild_id, channel_id) -> bool:
+    """Add/remove a channel from the antilink scope. Returns True if it is now enforced there."""
+    gid = str(guild_id)
+    chans = antilink_channels_map.setdefault(gid, set())
+    conn = get_db()
+    if channel_id in chans:
+        chans.discard(channel_id)
+        conn.execute("DELETE FROM antilink_channels WHERE guild_id=? AND channel_id=?", (int(gid), int(channel_id)))
+        added = False
+    else:
+        chans.add(channel_id)
+        conn.execute(
+            "INSERT OR IGNORE INTO antilink_channels (guild_id, channel_id) VALUES (?,?)",
+            (int(gid), int(channel_id))
+        )
+        added = True
+    conn.commit()
+    conn.close()
+    return added
+
+def load_antiswear_settings():
+    global antiswear_guilds, antiswear_words_map, antiswear_channels_map
+    antiswear_guilds = {}
+    antiswear_words_map = {}
+    antiswear_channels_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, enabled FROM antiswear_settings"):
+        antiswear_guilds[str(row["guild_id"])] = bool(row["enabled"])
+    for row in conn.execute("SELECT guild_id, word FROM antiswear_words"):
+        antiswear_words_map.setdefault(str(row["guild_id"]), set()).add(row["word"])
+    for row in conn.execute("SELECT guild_id, channel_id FROM antiswear_channels"):
+        antiswear_channels_map.setdefault(str(row["guild_id"]), set()).add(row["channel_id"])
+    conn.close()
+
+def save_antiswear_enabled(guild_id, enabled: bool):
+    gid = str(guild_id)
+    antiswear_guilds[gid] = enabled
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO antiswear_settings (guild_id, enabled) VALUES (?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET enabled=excluded.enabled",
+        (int(gid), 1 if enabled else 0)
+    )
+    conn.commit()
+    conn.close()
+
+def save_antiswear_words(guild_id, words):
+    """Replace the full banned-word list for a guild. `words` is an iterable of lowercase strings."""
+    gid = str(guild_id)
+    clean = {w.strip().lower() for w in words if w and w.strip()}
+    antiswear_words_map[gid] = clean
+    conn = get_db()
+    conn.execute("DELETE FROM antiswear_words WHERE guild_id=?", (int(gid),))
+    for w in clean:
+        conn.execute("INSERT OR IGNORE INTO antiswear_words (guild_id, word) VALUES (?,?)", (int(gid), w))
+    conn.commit()
+    conn.close()
+
+def toggle_antiswear_channel(guild_id, channel_id) -> bool:
+    """Add/remove a channel from the antiswear scope. Returns True if it is now enforced there."""
+    gid = str(guild_id)
+    chans = antiswear_channels_map.setdefault(gid, set())
+    conn = get_db()
+    if channel_id in chans:
+        chans.discard(channel_id)
+        conn.execute("DELETE FROM antiswear_channels WHERE guild_id=? AND channel_id=?", (int(gid), int(channel_id)))
+        added = False
+    else:
+        chans.add(channel_id)
+        conn.execute(
+            "INSERT OR IGNORE INTO antiswear_channels (guild_id, channel_id) VALUES (?,?)",
+            (int(gid), int(channel_id))
+        )
+        added = True
+    conn.commit()
+    conn.close()
+    return added
+
 def get_econ(gid, uid):
     g = economy.setdefault(str(gid), {})
     return g.setdefault(str(uid), {
@@ -1462,6 +1643,10 @@ load_rr()
 load_selfrole()
 load_staff_daily_channels()
 load_islam_settings()
+load_afk_go_text()
+load_staff_daily_text()
+load_antilink_settings()
+load_antiswear_settings()
 
 # --- BOT EVENTS ---
 
@@ -1486,6 +1671,7 @@ async def on_ready():
     bot.add_view(ASetApplyView())
     bot.add_view(StaffDoneView())
     bot.add_view(IslamSetupView())
+    bot.add_view(AntiSwearPanelView())
     for mid, buttons in list(rr_data.items()):
         if buttons:
             bot.add_view(ReactionRoleView(mid, buttons))
@@ -1650,7 +1836,9 @@ async def on_message(message):
 
     # --- ANTI-LINK FILTER ---
     if message.guild and anti_link_guilds.get(str(message.guild.id)):
-        has_link = bool(re.search(r'https?://|discord[.]gg/|www[.]', message.content, re.IGNORECASE))
+        scoped_link_channels = antilink_channels_map.get(str(message.guild.id), set())
+        in_link_scope = (not scoped_link_channels) or (message.channel.id in scoped_link_channels)
+        has_link = in_link_scope and bool(re.search(r'https?://|discord[.]gg/|www[.]', message.content, re.IGNORECASE))
         if has_link:
             has_exempt = any(
                 r.permissions.manage_messages or r.permissions.administrator
@@ -1659,13 +1847,56 @@ async def on_message(message):
             if not has_exempt:
                 try:
                     await message.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                try:
+                    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)
+                    await message.author.timeout(until, reason="Anti-link: sent a link")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                try:
                     await message.channel.send(
-                        f"⛔ {message.author.mention} لینک ناشەرعییە لەم کەناڵەدا! | Links are not allowed here!",
+                        f"⛔ {message.author.mention} لینک ناشەرعییە لەم کەناڵەدا! بۆیە بۆ ١ خولەک بێدەنگ کرایت. | "
+                        f"Links are not allowed here! You've been timed out for 1 minute.",
                         delete_after=5
                     )
                 except (discord.Forbidden, discord.HTTPException):
                     pass
                 return
+
+    # --- ANTI-SWEAR FILTER ---
+    if message.guild and antiswear_guilds.get(str(message.guild.id)):
+        gid_str = str(message.guild.id)
+        banned_words = antiswear_words_map.get(gid_str, set())
+        scoped_swear_channels = antiswear_channels_map.get(gid_str, set())
+        in_swear_scope = (not scoped_swear_channels) or (message.channel.id in scoped_swear_channels)
+        if banned_words and in_swear_scope:
+            content_lower = message.content.lower()
+            matched_word = next((w for w in banned_words if w and w in content_lower), None)
+            if matched_word:
+                has_exempt = any(
+                    r.permissions.manage_messages or r.permissions.administrator
+                    for r in getattr(message.author, 'roles', [])
+                )
+                if not has_exempt:
+                    try:
+                        await message.delete()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    try:
+                        until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)
+                        await message.author.timeout(until, reason="Anti-swear: used a banned word")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    try:
+                        await message.channel.send(
+                            f"⛔ {message.author.mention} قسەی خراپت بەکارهێنا، بۆیە بۆ ١ خولەک بێدەنگ کرایت. | "
+                            f"That word isn't allowed here! You've been timed out for 1 minute.",
+                            delete_after=5
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    return
 
     if message.guild is not None:
         # --- COOLER AFK SYSTEM: RETURN FROM AFK ---
@@ -2177,6 +2408,12 @@ async def on_member_remove(member):
 async def on_message_delete(message):
     if message.author.bot or not message.guild:
         return
+    sniped[message.channel.id] = {
+        "content": message.content or "*[Embed / Attachment]*",
+        "author": message.author.display_name,
+        "author_avatar": message.author.display_avatar.url,
+        "time": time.time(),
+    }
     gid = str(message.guild.id)
     if not log_channels.get(gid):
         return
@@ -2201,6 +2438,13 @@ async def on_message_edit(before, after):
         return
     if before.content == after.content:
         return
+    edit_sniped[before.channel.id] = {
+        "before": before.content or "—",
+        "after": after.content or "—",
+        "author": before.author.display_name,
+        "author_avatar": before.author.display_avatar.url,
+        "time": time.time(),
+    }
     gid = str(before.guild.id)
     if not log_channels.get(gid):
         return
@@ -2419,13 +2663,16 @@ async def _send_staff_daily(guild, channel, pings: str):
             pass
         staff_daily_last_msg.pop(gid, None)
 
+    custom = staff_daily_text_map.get(gid, {})
+    title = custom.get("title") or "📢 دەیلی ستاف"
+    description = custom.get("description") or (
+        "خۆشەویستان دەیلیەکانتان بکەن چات و ڤۆیسەگشتیەکان پڕ بکەن لە قەسی جوان\n"
+        "دەستی هەمولایەک خۆش بێت"
+    )
     embed = discord.Embed(
         color=0xF59E0B,
-        title="📢 دەیلی ستاف",
-        description=(
-            "خۆشەویستان دەیلیەکانتان بکەن چات و ڤۆیسەگشتیەکان پڕ بکەن لە قەسی جوان\n"
-            "دەستی هەمولایەک خۆش بێت"
-        ),
+        title=title,
+        description=description,
     )
     embed.set_footer(text=f"{guild.name} · ستاف تیم — کاتژمێر ٩ ئێوارە")
     if guild.icon:
@@ -5629,6 +5876,8 @@ async def rps(ctx, choice: str = None):
     emojis = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
     await ctx.send(f"You | تۆ: {emojis[user]} {user}\nMe | من: {emojis[bot_choice]} {bot_choice}\n**{result}**")
 
+sniped = {}       # {channel_id: {"content", "author", "author_avatar", "time"}}
+edit_sniped = {}  # {channel_id: {"before", "after", "author", "author_avatar", "time"}}
 number_games = {}
 hangman_games = {}
 lucky_games = {}
@@ -5765,9 +6014,56 @@ async def luckylb(ctx):
     embed.set_footer(text=f"{ctx.guild.name} · Play with $lucky!")
     await ctx.send(embed=embed)
 
+class BombView(discord.ui.View):
+    """Pick the correct wire to defuse the bomb before it 'explodes'."""
+
+    WIRE_COLORS = {
+        "Red": discord.ButtonStyle.danger,
+        "Blue": discord.ButtonStyle.primary,
+        "Green": discord.ButtonStyle.success,
+        "Yellow": discord.ButtonStyle.secondary,
+    }
+
+    def __init__(self, correct_wire: str, author_id: int):
+        super().__init__(timeout=30)
+        self.correct_wire = correct_wire
+        self.author_id = author_id
+        self.resolved = False
+        for color, style in self.WIRE_COLORS.items():
+            self.add_item(self._make_button(color, style))
+
+    def _make_button(self, color: str, style: discord.ButtonStyle):
+        btn = discord.ui.Button(label=color, style=style)
+
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.author_id:
+                return await interaction.response.send_message(
+                    "❌ ئەمە یاری تۆ نییە! | This isn't your game!", ephemeral=True
+                )
+            self.resolved = True
+            for item in self.children:
+                item.disabled = True
+            if color == self.correct_wire:
+                text = f"✅ {interaction.user.mention} cut the **{color}** wire — the bomb is defused! 🎉\nخەڵاتکرا!"
+            else:
+                text = (f"💥 {interaction.user.mention} cut the **{color}** wire — BOOM! "
+                        f"The correct wire was **{self.correct_wire}**.\nتەقا! وایەری دروست **{self.correct_wire}** بوو.")
+            self.stop()
+            await interaction.response.edit_message(content=text, embed=None, view=self)
+
+        btn.callback = callback
+        return btn
+
+    async def on_timeout(self):
+        if self.resolved:
+            return
+        for item in self.children:
+            item.disabled = True
+
+
 @bot.command()
 async def bomb(ctx):
-    wires = ["Red", "Blue", "Green", "Yellow"]
+    wires = list(BombView.WIRE_COLORS.keys())
     correct_wire = random.choice(wires)
     embed = discord.Embed(
         title="💣 Defuse the Bomb! / بۆمبەکە خەڵات بکە!",
@@ -5778,7 +6074,7 @@ async def bomb(ctx):
         color=discord.Color.orange()
     )
     embed.set_footer(text="Choose wisely! / بە تێڕوانین هەڵبژێرە!")
-    view = BombView(correct_wire)
+    view = BombView(correct_wire, ctx.author.id)
     await ctx.send(embed=embed, view=view)
 
 
@@ -7484,8 +7780,19 @@ async def afk(ctx, *, reason: str = "AFK"):
     afk_moods = ["🌙", "😴", "💤", "🛌", "🎧", "🌌", "☕", "🔇"]
     mood = random.choice(afk_moods)
 
+    gid_str = str(ctx.guild.id)
+    go_text_template = afk_go_text_map.get(gid_str, "").strip()
+    if go_text_template:
+        try:
+            description = go_text_template.format(user=ctx.author.mention, reason=reason)
+        except (KeyError, IndexError, ValueError):
+            description = go_text_template
+    else:
+        description = "{user} is now AFK. | {user} لە دۆخی AFK دایە.".format(user=ctx.author.mention)
+
     embed = discord.Embed(
         title=f"{mood}  Gone AFK | ڕوحستی",
+        description=description,
         color=discord.Color.from_rgb(88, 101, 242),
         timestamp=datetime.datetime.utcfromtimestamp(afk_since)
     )
@@ -7499,6 +7806,43 @@ async def afk(ctx, *, reason: str = "AFK"):
         embed.set_thumbnail(url=ctx.author.display_avatar.url)
     embed.set_footer(text="Send any message to come back • Your nickname & status are updated | هەر پەیامێک بنێرە بۆ گەڕانەوە • ناو و دۆخت نوێکراوەتەوە")
     await ctx.send(embed=embed)
+
+@bot.command(name="editafk")
+@commands.has_permissions(administrator=True)
+async def editafk_cmd(ctx, *, text: str = None):
+    """Customize the sentence shown when someone goes AFK (!afk). Does NOT affect the welcome-back message."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    if not text:
+        current = afk_go_text_map.get(str(ctx.guild.id), "").strip()
+        preview = current if current else "{user} is now AFK. | {user} لە دۆخی AFK دایە. (default)"
+        embed = discord.Embed(
+            color=0x5865F2,
+            title="✏️ Edit AFK Sentence | دەقی AFK بگۆڕە",
+            description=(
+                f"**Current sentence:**\n{preview}\n\n"
+                "**Usage:** `!editafk <sentence>`\n"
+                "You can use `{user}` and `{reason}` as placeholders.\n\n"
+                "**Example:** `!editafk {user} stepped away — {reason}`\n\n"
+                "⚠️ This only changes the message shown when someone runs `!afk`. "
+                "It does not change the \"Welcome Back\" message shown when they return."
+            ),
+        )
+        return await ctx.send(embed=embed)
+
+    save_afk_go_text(ctx.guild.id, text)
+    embed = discord.Embed(
+        color=0x57F287,
+        title="✅ AFK Sentence Updated | دەقی AFK نوێکرایەوە",
+        description=f"New sentence:\n{text}",
+    )
+    embed.set_footer(text="Placeholders: {user}, {reason} · Only affects the !afk message, not the welcome-back message.")
+    await ctx.send(embed=embed)
+
+@editafk_cmd.error
+async def editafk_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی ئەدمین پێویستە. | You need Administrator permission.")
 
 @bot.command()
 async def github(ctx, user: str):
@@ -7635,9 +7979,13 @@ HELP_CATEGORIES = [
         ("!vcunmute @member",                 "VC unmute member | بێدەنگی VC بکرێتەوە"),
         ("!vcdisconnect @member",             "Disconnect from VC | لە VC دەرببە"),
         ("!anti_link",                        "Toggle anti-link filter | فیلتەری لینک چالاک/ناچالاک"),
+        ("!setantilinkchannel [#channel]",    "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
+        ("!antiswear",                        "Toggle anti-swear filter + word panel | فیلتەری قسەی خراپ"),
+        ("!setantichannel [#channel]",        "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
     ]),
     ("💤 AFK", [
         ("!afk [reason]",                     "Set AFK status | دۆخی AFK دیاری بکە"),
+        ("!editafk <sentence>",               "Edit the sentence shown on !afk (admin) | دەقی AFK بگۆڕە"),
     ]),
     ("🎁 Giveaway | گیڤەوەی", [
         ("!gcreate",                          "Start a giveaway (form) | فۆرمی بەخشین"),
@@ -7789,7 +8137,10 @@ PANEL_CATEGORIES = [
         ("!stafflist",                           "Show all staff members | لیستی هەموو ستافەکان"),
         ("!setdonelog #channel",                 "Staff done-log channel — NEEDS: #channel | چانێلی تۆمارکردنی کار — پێویست: #channel"),
         ("!anti_link",                           "Toggle anti-link filter (Manage Server) | فیلتەری لینک"),
-        ("!setupstaffdaily",                     "Pick roles pinged by auto staff daily (interactive) | رۆڵی پینگی دەیلی ستاف دیاری بکە"),
+        ("!setantilinkchannel [#channel]",       "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
+        ("!antiswear",                           "Toggle anti-swear filter + word panel (Manage Server) | فیلتەری قسەی خراپ"),
+        ("!setantichannel [#channel]",           "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
+        ("!setupstaffdaily",                     "Pick roles pinged by auto staff daily + Edit Text button (interactive) | رۆڵی پینگی دەیلی ستاف و دەقی دیاری بکە"),
         ("!staff daily",                         "Show staff daily config / send test ping | دۆخی دەیلی ستاف و تاقیکردنەوە"),
         ("!staff setchannel #channel",           "Auto-daily staff channel — NEEDS: #channel | چانێلی ئۆتۆی ستاف — پێویست: #channel"),
         ("!staff removechannel",                 "Remove auto-daily staff channel | چانێلی ئۆتۆ لابدە"),
@@ -9708,6 +10059,135 @@ def build_bomb_grid(safe_picks, remaining):
     return grid.strip()
 
 
+td_sessions = {}  # {channel_id: TDSession}
+
+TD_TRUTH_PROMPTS = [
+    "What's the most embarrassing thing that's happened to you? | خەجاڵەتاوەرترین شت کە بۆت ڕوویداوە چییە؟",
+    "What's a secret you've never told anyone here? | چ نهێنیەکت هەیە کە هەرگیز بەکەسێک نەتووە؟",
+    "What's your biggest fear? | گەورەترین ترسی تۆ چییە؟",
+    "Who's your crush in this server? | کێ حەزت لێیەتی لەم سێرڤەرەدا؟",
+    "What's the last lie you told? | کۆتا درۆیەک کە کردت چی بوو؟",
+    "What's something you regret doing? | چ شتێکت هەیە پەشیمانیت لێی هەیە؟",
+]
+
+TD_DARE_PROMPTS = [
+    "Send the last photo in your gallery. | کۆتا وێنە لە گالەریت بنێرە.",
+    "Type only in emojis for the next 3 messages. | تەنها بە ئیمۆجی بنووسە بۆ ٣ پەیامی داهاتوو.",
+    "Change your nickname to something silly for 10 minutes. | ناوی خۆت بۆ ماوەی ١٠ خولەک بگۆڕە بۆ شتێکی گاڵتەئامێز.",
+    "Message a random member 'I like your vibe'. | پەیامێک بنێرە بۆ ئەندامێکی هەڕەمەکی 'حەزم لە شێوازتە'.",
+    "Post your most recent search history (safe part). | کۆتا گەڕانەکانت پۆست بکە (بەشی سەلامەت).",
+    "Speak in rhymes for your next message. | بە شیعر بنووسە بۆ پەیامی داهاتووت.",
+]
+
+
+class TDSession:
+    def __init__(self, host_id: int, channel_id: int):
+        self.host_id = host_id
+        self.opponent_id = None
+        self.channel_id = channel_id
+        self.turn = host_id
+        self.lobby_msg = None
+        self.round = 0
+
+
+def _td_lobby_embed(user: discord.abc.User, status: str, opponent: discord.abc.User = None):
+    if status == "waiting":
+        embed = discord.Embed(
+            title="🎲 Truth or Dare | ڕاستی یان جوڕیمە",
+            description=(
+                f"{user.mention} started a 1v1 Truth or Dare game!\n"
+                f"{user.mention} یارییەکی Truth or Dare ی ١ بەرامبەر ١ دەستپێکرد!\n\n"
+                "Click **Join** to play against them. | کلیک لە **بەشداریکردن** بکە بۆ یاریکردن لە دژی."
+            ),
+            color=0x5865F2,
+        )
+    else:
+        embed = discord.Embed(
+            title="🎲 Truth or Dare | ڕاستی یان جوڕیمە",
+            description=(
+                f"{user.mention} 🆚 {opponent.mention}\n\n"
+                f"It's {user.mention}'s turn — choose **Truth** or **Dare**!\n"
+                f"دەوری {user.mention}ـە — **ڕاستی** یان **جوڕیمە** هەڵبژێرە!"
+            ),
+            color=0x57F287,
+        )
+    return embed
+
+
+class TDGameView(discord.ui.View):
+    def __init__(self, cid: int):
+        super().__init__(timeout=120)
+        self.cid = cid
+
+    async def _current_player_only(self, interaction: discord.Interaction) -> bool:
+        session = td_sessions.get(self.cid)
+        if not session or interaction.user.id != session.turn:
+            await interaction.response.send_message(
+                "❌ دەوری تۆ نییە! | It's not your turn!", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="🗣️ Truth | ڕاستی", style=discord.ButtonStyle.primary)
+    async def truth_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._current_player_only(interaction):
+            return
+        await self._answer(interaction, random.choice(TD_TRUTH_PROMPTS))
+
+    @discord.ui.button(label="🔥 Dare | جوڕیمە", style=discord.ButtonStyle.danger)
+    async def dare_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._current_player_only(interaction):
+            return
+        await self._answer(interaction, random.choice(TD_DARE_PROMPTS))
+
+    async def _answer(self, interaction: discord.Interaction, prompt: str):
+        session = td_sessions.get(self.cid)
+        if not session:
+            return await interaction.response.send_message("❌ Game ended. | یاری کۆتایی هات.", ephemeral=True)
+        session.round += 1
+        other_id = session.opponent_id if interaction.user.id == session.host_id else session.host_id
+        session.turn = other_id
+        guild = interaction.guild
+        next_user = guild.get_member(other_id) if guild else None
+        prompt_embed = discord.Embed(
+            title=f"🎯 Round {session.round}",
+            description=f"{interaction.user.mention}:\n\n{prompt}",
+            color=0xF59E0B,
+        )
+        next_embed = _td_lobby_embed(next_user or interaction.user, "playing", opponent=interaction.user)
+        await interaction.response.edit_message(embeds=[prompt_embed, next_embed], view=self)
+
+
+class TDLobbyView(discord.ui.View):
+    def __init__(self, cid: int, host_id: int):
+        super().__init__(timeout=180)
+        self.cid = cid
+        self.host_id = host_id
+
+    @discord.ui.button(label="✅ Join | بەشداریکردن", style=discord.ButtonStyle.success)
+    async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = td_sessions.get(self.cid)
+        if not session:
+            return await interaction.response.send_message("❌ Game expired. | یاری بەسەرچووە.", ephemeral=True)
+        if interaction.user.id == self.host_id:
+            return await interaction.response.send_message(
+                "❌ ناتوانیت لە دژی خۆت یاری بکەیت! | You can't play against yourself!", ephemeral=True
+            )
+        if session.opponent_id is not None:
+            return await interaction.response.send_message(
+                "❌ ئەم یارییە پڕە! | This game is already full!", ephemeral=True
+            )
+        session.opponent_id = interaction.user.id
+        game_view = TDGameView(self.cid)
+        host = interaction.guild.get_member(self.host_id) if interaction.guild else None
+        embed = _td_lobby_embed(host or interaction.user, "playing", opponent=interaction.user)
+        self.stop()
+        await interaction.response.edit_message(embed=embed, view=game_view)
+
+    async def on_timeout(self):
+        td_sessions.pop(self.cid, None)
+
+
 @bot.command(name="td")
 async def truth_or_dare(ctx):
     """Start a 1v1 Truth or Dare game. | یارییەکی ١ بەرامبەر ١ راستی یان جوریمەی دەستپێ بکە."""
@@ -10951,8 +11431,11 @@ async def anti_link_cmd(ctx):
         return await ctx.send("Server only. | تەنها لە سێرڤەر.")
     gid = str(ctx.guild.id)
     current = anti_link_guilds.get(gid, False)
-    anti_link_guilds[gid] = not current
     status = not current
+    save_antilink_enabled(gid, status)
+    scoped = antilink_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped
+                  else "هەموو کەناڵەکان | All channels")
     if status:
         embed = discord.Embed(
             color=0x57F287,
@@ -10960,8 +11443,11 @@ async def anti_link_cmd(ctx):
             description=(
                 "فیلتەری لینک چالاک کرا بۆ ئەم سێرڤەرە.\n"
                 "Anti-link filter has been **enabled** for this server.\n\n"
-                "ئەندامانی ئاسایی ناتوانن لینک بنێرن. ئەوانەی کە مووچەی Manage Messages هەیانە دەتوانن.\n"
-                "Regular members cannot send links. Staff with Manage Messages permission can."
+                "ئەندامانی ئاسایی ناتوانن لینک بنێرن، دەگیرێنرێت و بۆ ١ خولەک بێدەنگ دەکرێن.\n"
+                "Regular members cannot send links — their message is deleted and they're timed out for 1 minute. "
+                "Staff with Manage Messages/Administrator are exempt.\n\n"
+                f"**کەناڵەکان | Scoped channels:** {scope_text}\n"
+                "Use `!setantilinkchannel #channel` to limit this to specific channels."
             )
         )
     else:
@@ -10980,6 +11466,168 @@ async def anti_link_cmd(ctx):
 async def anti_link_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="setantilinkchannel", aliases=["antilinkchannel"])
+@commands.has_permissions(manage_guild=True)
+async def setantilinkchannel_cmd(ctx, channel: discord.TextChannel = None):
+    """Toggle a channel in/out of the anti-link enforcement scope. Empty scope = all channels."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    target = channel or ctx.channel
+    gid = str(ctx.guild.id)
+    added = toggle_antilink_channel(gid, target.id)
+    scoped = antilink_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped
+                  else "هەموو کەناڵەکان | All channels")
+    if added:
+        desc = f"✅ {target.mention} زیادکرا بۆ فیلتەری لینک. | {target.mention} added to the anti-link scope."
+    else:
+        desc = f"➖ {target.mention} لابرا لە فیلتەری لینک. | {target.mention} removed from the anti-link scope."
+    embed = discord.Embed(
+        color=0x5865F2,
+        title="🔗 کەناڵی فیلتەری لینک | Anti-Link Channel",
+        description=f"{desc}\n\n**کەناڵی ئێستا | Current scope:** {scope_text}",
+    )
+    await ctx.send(embed=embed)
+
+@setantilinkchannel_cmd.error
+async def setantilinkchannel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+    elif isinstance(error, commands.ChannelNotFound):
+        await ctx.send("❌ کەناڵ نەدۆزرایەوە. | Channel not found.")
+
+
+# ═══════════════ ANTI-SWEAR FILTER ═══════════════
+
+class AntiSwearWordsModal(discord.ui.Modal, title="📝 Anti-Swear Words"):
+    words_input = discord.ui.TextInput(
+        label="Banned words | وشەی قەدەغەکراو",
+        style=discord.TextStyle.paragraph,
+        placeholder="Separate words with commas or new lines...",
+        max_length=2000,
+        required=False,
+    )
+
+    def __init__(self, current_words: str = ""):
+        super().__init__()
+        self.words_input.default = current_words
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        raw = self.words_input.value or ""
+        words = [w for chunk in raw.split("\n") for w in chunk.split(",")]
+        words = [w.strip() for w in words if w.strip()]
+        if gid:
+            save_antiswear_words(gid, words)
+            if words and not antiswear_guilds.get(gid, False):
+                save_antiswear_enabled(gid, True)
+        count = len(antiswear_words_map.get(gid, set())) if gid else 0
+        await interaction.response.send_message(
+            f"✅ وشەی قەدەغەکراو نوێکرایەوە ({count} وشە). | Banned word list updated ({count} word(s)).",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message(
+                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+            )
+        except Exception:
+            pass
+
+
+class AntiSwearPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="📝 Text Words | وشەکان",
+        style=discord.ButtonStyle.secondary,
+        custom_id="antiswear:words",
+        row=0,
+    )
+    async def text_words(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ تەنها ئەدمین دەتوانێت وشەکان بگۆڕێت. | Only administrators can edit the word list.",
+                ephemeral=True,
+            )
+        gid = str(interaction.guild.id) if interaction.guild else ""
+        current = ", ".join(sorted(antiswear_words_map.get(gid, set())))
+        modal = AntiSwearWordsModal(current_words=current)
+        await interaction.response.send_modal(modal)
+
+
+@bot.command(name="antiswear", aliases=["anti_swear", "swearfilter"])
+@commands.has_permissions(manage_guild=True)
+async def antiswear_cmd(ctx):
+    """Toggle the anti-swear filter and show the panel to manage its word list."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    current = antiswear_guilds.get(gid, False)
+    status = not current
+    save_antiswear_enabled(gid, status)
+    words = antiswear_words_map.get(gid, set())
+    scoped = antiswear_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped
+                  else "هەموو کەناڵەکان | All channels")
+    color = 0x57F287 if status else 0xED4245
+    status_text = ("چالاک | Enabled" if status else "ناچالاک | Disabled")
+    embed = discord.Embed(
+        color=color,
+        title="🚫 فیلتەری قسەی خراپ | Anti-Swear Filter",
+        description=(
+            f"**دۆخ | Status:** {status_text}\n"
+            f"**ژمارەی وشەکان | Words configured:** {len(words)}\n"
+            f"**کەناڵەکان | Scoped channels:** {scope_text}\n\n"
+            "پەیامی کۆنترۆڵکراو دەسڕدرێتەوە و ناردەرەکەی بۆ ١ خولەک بێدەنگ دەکرێت.\n"
+            "Matched messages are deleted and the sender is timed out for 1 minute. "
+            "Staff with Manage Messages/Administrator are exempt.\n\n"
+            "Click **Text Words** below to set the banned words (any number, any words). "
+            "Use `!setantichannel #channel` to limit enforcement to specific channels."
+        ),
+    )
+    embed.set_footer(text=f"لەلایەن | By: {ctx.author.display_name}")
+    await ctx.send(embed=embed, view=AntiSwearPanelView())
+
+@antiswear_cmd.error
+async def antiswear_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="setantichannel", aliases=["antiswearchannel"])
+@commands.has_permissions(manage_guild=True)
+async def setantichannel_cmd(ctx, channel: discord.TextChannel = None):
+    """Toggle a channel in/out of the anti-swear enforcement scope. Empty scope = all channels."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    target = channel or ctx.channel
+    gid = str(ctx.guild.id)
+    added = toggle_antiswear_channel(gid, target.id)
+    scoped = antiswear_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped
+                  else "هەموو کەناڵەکان | All channels")
+    if added:
+        desc = f"✅ {target.mention} زیادکرا بۆ فیلتەری قسەی خراپ. | {target.mention} added to the anti-swear scope."
+    else:
+        desc = f"➖ {target.mention} لابرا لە فیلتەری قسەی خراپ. | {target.mention} removed from the anti-swear scope."
+    embed = discord.Embed(
+        color=0x5865F2,
+        title="🚫 کەناڵی فیلتەری قسەی خراپ | Anti-Swear Channel",
+        description=f"{desc}\n\n**کەناڵی ئێستا | Current scope:** {scope_text}",
+    )
+    await ctx.send(embed=embed)
+
+@setantichannel_cmd.error
+async def setantichannel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+    elif isinstance(error, commands.ChannelNotFound):
+        await ctx.send("❌ کەناڵ نەدۆزرایەوە. | Channel not found.")
 
 
 # ═══════════════ SETUP STAFF DAILY ═══════════════
@@ -11014,10 +11662,71 @@ class StaffDailyRoleSelect(discord.ui.RoleSelect):
         await interaction.response.edit_message(embed=embed, view=None)
 
 
+class StaffDailyEditTextModal(discord.ui.Modal, title="✏️ Edit Staff Daily Text"):
+    daily_title = discord.ui.TextInput(
+        label="Title | سەردێڕ",
+        style=discord.TextStyle.short,
+        max_length=256,
+        required=False,
+    )
+    daily_description = discord.ui.TextInput(
+        label="Sentence / Description | دەق",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=False,
+    )
+
+    def __init__(self, current_title: str = "", current_description: str = ""):
+        super().__init__()
+        self.daily_title.default = current_title
+        self.daily_description.default = current_description
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        if gid:
+            save_staff_daily_text(gid, self.daily_title.value.strip(), self.daily_description.value.strip())
+        await interaction.response.send_message(
+            "✅ دەقی دەیلی ستاف نوێکرایەوە! | Staff daily text updated! 📢",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message(
+                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+            )
+        except Exception:
+            pass
+
+
+class StaffDailyEditTextButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="✏️ Edit Text | دەقی بگۆڕە",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ تەنها ئەدمین دەتوانێت دەقەکە بگۆڕێت. | Only administrators can edit this text.",
+                ephemeral=True,
+            )
+        gid = str(interaction.guild.id) if interaction.guild else ""
+        current = staff_daily_text_map.get(gid, {})
+        modal = StaffDailyEditTextModal(
+            current_title=current.get("title", ""),
+            current_description=current.get("description", ""),
+        )
+        await interaction.response.send_modal(modal)
+
+
 class StaffDailySetupView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
         self.add_item(StaffDailyRoleSelect())
+        self.add_item(StaffDailyEditTextButton())
 
 
 @bot.command(name="setupstaffdaily", aliases=["setstaffdaily", "staffdailysetup"])
@@ -11733,8 +12442,10 @@ async def removereklam_cmd(ctx):
         )
 
     try:
+        conn = get_db()
         conn.execute("DELETE FROM reklam_settings WHERE guild_id=?", (ctx.guild.id,))
         conn.commit()
+        conn.close()
     except Exception as e:
         return await ctx.send(f"❌ هەڵە: `{e}`")
 
