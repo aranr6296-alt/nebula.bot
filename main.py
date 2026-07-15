@@ -362,6 +362,26 @@ def init_db():
             channel_id INTEGER,
             PRIMARY KEY (guild_id, channel_id)
         );
+        CREATE TABLE IF NOT EXISTS staff_done_text (
+            guild_id    INTEGER PRIMARY KEY,
+            title       TEXT DEFAULT '',
+            description TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS ticket_panel_text (
+            guild_id INTEGER PRIMARY KEY,
+            text_en  TEXT DEFAULT '',
+            text_ku  TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS verify_settings (
+            guild_id   INTEGER PRIMARY KEY,
+            role_id    INTEGER,
+            channel_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS eventspeed_settings (
+            guild_id INTEGER PRIMARY KEY,
+            text     TEXT DEFAULT '',
+            role_ids TEXT DEFAULT ''
+        );
     """)
     conn.commit()
     conn.close()
@@ -379,6 +399,7 @@ def _migrate_db():
             guild_id INTEGER PRIMARY KEY,
             text TEXT DEFAULT ''
         )""",
+        "ALTER TABLE ticket_settings ADD COLUMN panel_message_id TEXT DEFAULT ''",
     ]
     for sql in migrations:
         try:
@@ -436,6 +457,10 @@ rules_settings   = {}  # {guild_id: {"text_en": str, "text_ku": str}}
 staff_daily_last_msg = {}  # {guild_id: message_id}
 islam_settings_map = {}   # {guild_id: {channel_id, role_id, text_en, text_ku}}
 islam_last_msg_map  = {}  # {guild_id: message_id}
+staff_done_text_map = {}  # {guild_id: {"title": str, "description": str}}
+ticket_panel_text_map = {}  # {guild_id: {"text_en": str, "text_ku": str}}
+verify_settings_map = {}  # {guild_id: {"role_id": int, "channel_id": int}}
+eventspeed_settings_map = {}  # {guild_id: {"text": str, "role_ids": [int, ...]}}
 tags_data = {}  # {guild_id_str: {tag_name_lower: {"response": str, "name": str, "created_by": int}}}
 message_cooldowns = {}
 voice_sessions = {}
@@ -575,12 +600,13 @@ def load_ticket_settings():
     ticket_settings = {}
     open_tickets_map = {}
     conn = get_db()
-    for row in conn.execute("SELECT guild_id, staff_role_id, category_id, log_channel_id, panel_channel_id FROM ticket_settings"):
+    for row in conn.execute("SELECT guild_id, staff_role_id, category_id, log_channel_id, panel_channel_id, panel_message_id FROM ticket_settings"):
         ticket_settings[str(row["guild_id"])] = {
             "staff_role_id": row["staff_role_id"],
             "category_id": row["category_id"],
             "log_channel_id": row["log_channel_id"],
             "panel_channel_id": row["panel_channel_id"],
+            "panel_message_id": row["panel_message_id"],
         }
     for row in conn.execute("SELECT guild_id, user_id, channel_id FROM open_tickets"):
         open_tickets_map[(str(row["guild_id"]), str(row["user_id"]))] = row["channel_id"]
@@ -590,11 +616,13 @@ def save_ticket_settings():
     conn = get_db()
     for gid, s in ticket_settings.items():
         conn.execute(
-            "INSERT INTO ticket_settings (guild_id, staff_role_id, category_id, log_channel_id, panel_channel_id) "
-            "VALUES (?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
+            "INSERT INTO ticket_settings (guild_id, staff_role_id, category_id, log_channel_id, panel_channel_id, panel_message_id) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
             "staff_role_id=excluded.staff_role_id, category_id=excluded.category_id, "
-            "log_channel_id=excluded.log_channel_id, panel_channel_id=excluded.panel_channel_id",
-            (int(gid), s.get("staff_role_id"), s.get("category_id"), s.get("log_channel_id"), s.get("panel_channel_id"))
+            "log_channel_id=excluded.log_channel_id, panel_channel_id=excluded.panel_channel_id, "
+            "panel_message_id=excluded.panel_message_id",
+            (int(gid), s.get("staff_role_id"), s.get("category_id"), s.get("log_channel_id"),
+             s.get("panel_channel_id"), s.get("panel_message_id"))
         )
     conn.commit()
     conn.close()
@@ -1356,6 +1384,102 @@ def save_staff_daily_text(guild_id, title, description):
     conn.commit()
     conn.close()
 
+def load_staff_done_text():
+    global staff_done_text_map
+    staff_done_text_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, title, description FROM staff_done_text"):
+        staff_done_text_map[str(row["guild_id"])] = {
+            "title": row["title"] or "", "description": row["description"] or ""
+        }
+    conn.close()
+
+def save_staff_done_text(guild_id, title, description):
+    gid = str(guild_id)
+    staff_done_text_map[gid] = {"title": title, "description": description}
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO staff_done_text (guild_id, title, description) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET title=excluded.title, description=excluded.description",
+        (int(gid), title, description)
+    )
+    conn.commit()
+    conn.close()
+
+def load_ticket_panel_text():
+    global ticket_panel_text_map
+    ticket_panel_text_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, text_en, text_ku FROM ticket_panel_text"):
+        ticket_panel_text_map[str(row["guild_id"])] = {
+            "text_en": row["text_en"] or "", "text_ku": row["text_ku"] or ""
+        }
+    conn.close()
+
+def save_ticket_panel_text(guild_id, text_en, text_ku):
+    gid = str(guild_id)
+    ticket_panel_text_map[gid] = {"text_en": text_en, "text_ku": text_ku}
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO ticket_panel_text (guild_id, text_en, text_ku) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET text_en=excluded.text_en, text_ku=excluded.text_ku",
+        (int(gid), text_en, text_ku)
+    )
+    conn.commit()
+    conn.close()
+
+def load_verify_settings():
+    global verify_settings_map
+    verify_settings_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, role_id, channel_id FROM verify_settings"):
+        verify_settings_map[str(row["guild_id"])] = {
+            "role_id": row["role_id"], "channel_id": row["channel_id"]
+        }
+    conn.close()
+
+def save_verify_settings(guild_id, role_id, channel_id):
+    gid = str(guild_id)
+    verify_settings_map[gid] = {"role_id": role_id, "channel_id": channel_id}
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO verify_settings (guild_id, role_id, channel_id) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id, channel_id=excluded.channel_id",
+        (int(gid), int(role_id), int(channel_id))
+    )
+    conn.commit()
+    conn.close()
+
+def load_eventspeed_settings():
+    global eventspeed_settings_map
+    eventspeed_settings_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, text, role_ids FROM eventspeed_settings"):
+        ids_raw = row["role_ids"] or ""
+        role_ids = [int(x) for x in ids_raw.split(",") if x.strip().isdigit()]
+        eventspeed_settings_map[str(row["guild_id"])] = {
+            "text": row["text"] or "", "role_ids": role_ids
+        }
+    conn.close()
+
+def save_eventspeed_settings(guild_id, text=None, role_ids=None):
+    gid = str(guild_id)
+    current = eventspeed_settings_map.get(gid, {"text": "", "role_ids": []})
+    if text is not None:
+        current["text"] = text
+    if role_ids is not None:
+        current["role_ids"] = list(role_ids)
+    eventspeed_settings_map[gid] = current
+    conn = get_db()
+    ids_str = ",".join(str(r) for r in current["role_ids"])
+    conn.execute(
+        "INSERT INTO eventspeed_settings (guild_id, text, role_ids) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET text=excluded.text, role_ids=excluded.role_ids",
+        (int(gid), current["text"], ids_str)
+    )
+    conn.commit()
+    conn.close()
+
 def load_antilink_settings():
     global anti_link_guilds, antilink_channels_map
     anti_link_guilds = {}
@@ -1647,6 +1771,10 @@ load_afk_go_text()
 load_staff_daily_text()
 load_antilink_settings()
 load_antiswear_settings()
+load_staff_done_text()
+load_ticket_panel_text()
+load_verify_settings()
+load_eventspeed_settings()
 
 # --- BOT EVENTS ---
 
@@ -1672,6 +1800,7 @@ async def on_ready():
     bot.add_view(StaffDoneView())
     bot.add_view(IslamSetupView())
     bot.add_view(AntiSwearPanelView())
+    bot.add_view(VerifyPanelView())
     for mid, buttons in list(rr_data.items()):
         if buttons:
             bot.add_view(ReactionRoleView(mid, buttons))
@@ -2674,7 +2803,7 @@ async def _send_staff_daily(guild, channel, pings: str):
         title=title,
         description=description,
     )
-    embed.set_footer(text=f"{guild.name} · ستاف تیم — کاتژمێر ٩ ئێوارە")
+    embed.set_footer(text=f"{guild.name} · ستاف تیم — کاتژمێر ٦ ئێوارە")
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     try:
@@ -2688,7 +2817,8 @@ async def _send_staff_daily(guild, channel, pings: str):
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-@tasks.loop(time=datetime.time(hour=21, minute=0, second=0, tzinfo=datetime.timezone.utc))
+# Iraq time = UTC+3 → 6 PM Iraq = 15:00 UTC.
+@tasks.loop(time=datetime.time(hour=15, minute=0, second=0, tzinfo=datetime.timezone.utc))
 async def staff_daily_task():
     for guild in bot.guilds:
         gid = str(guild.id)
@@ -7982,6 +8112,10 @@ HELP_CATEGORIES = [
         ("!setantilinkchannel [#channel]",    "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
         ("!antiswear",                        "Toggle anti-swear filter + word panel | فیلتەری قسەی خراپ"),
         ("!setantichannel [#channel]",        "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
+        ("!verify [#channel]",                "Set up / re-post the self-verification panel (admin) | دانانی پانێلی پشتڕاستکردنەوە"),
+        ("!seteventspeed",                    "Configure Event Speed text + roles to ping (admin) | دانانی دەق و ڕۆڵی ئیڤێنت سپید"),
+        ("!eventspeedpanel",                  "Post the Event Speed announcement (admin) | ناردنی ئیڤێنت سپید"),
+        ("!closeticket",                      "Close the current ticket (owner/staff) | داخستنی تیکەت"),
     ]),
     ("💤 AFK", [
         ("!afk [reason]",                     "Set AFK status | دۆخی AFK دیاری بکە"),
@@ -8140,10 +8274,16 @@ PANEL_CATEGORIES = [
         ("!setantilinkchannel [#channel]",       "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
         ("!antiswear",                           "Toggle anti-swear filter + word panel (Manage Server) | فیلتەری قسەی خراپ"),
         ("!setantichannel [#channel]",           "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
-        ("!setupstaffdaily",                     "Pick roles pinged by auto staff daily + Edit Text button (interactive) | رۆڵی پینگی دەیلی ستاف و دەقی دیاری بکە"),
+        ("!verify [#channel]",                   "Set up / re-post the self-verification panel | دانانی پانێلی پشتڕاستکردنەوە"),
+        ("!setupstaffdaily",                     "Pick roles pinged by auto staff daily (6 PM Iraq time) + Edit Text button | رۆڵی پینگی دەیلی ستاف و دەقی دیاری بکە"),
         ("!staff daily",                         "Show staff daily config / send test ping | دۆخی دەیلی ستاف و تاقیکردنەوە"),
         ("!staff setchannel #channel",           "Auto-daily staff channel — NEEDS: #channel | چانێلی ئۆتۆی ستاف — پێویست: #channel"),
         ("!staff removechannel",                 "Remove auto-daily staff channel | چانێلی ئۆتۆ لابدە"),
+        ("!editstaffdone",                       "Edit the title/description text on the Staff Done panel (admin) | دەقی Staff Done بگۆڕە"),
+        ("!editticketpanel",                     "Edit the English/Kurdish text on the ticket panel (admin) | دەقی پانێلی تیکەت بگۆڕە"),
+        ("!seteventspeed",                       "Configure Event Speed text + roles to ping | دانانی دەق و ڕۆڵی ئیڤێنت سپید"),
+        ("!eventspeedpanel",                     "Post the Event Speed announcement | ناردنی ئیڤێنت سپید"),
+        ("!closeticket",                         "Close the current ticket (owner/staff) | داخستنی تیکەت"),
     ]),
 ]
 
@@ -8440,11 +8580,19 @@ def _guild_icon_url(guild: discord.Guild):
 
 # ── Ticket panel embed builders ───────────────────────────────────────────────
 
-def build_ticket_panel_embed(guild_name: str, icon_url: str = None) -> discord.Embed:
-    embed = discord.Embed(
-        color=0xFFD700,
-        title=f"🎫 {guild_name} — پشتگیری | Support",
-        description=(
+def build_ticket_panel_embed(guild_name: str, icon_url: str = None, gid: str = None) -> discord.Embed:
+    custom = ticket_panel_text_map.get(gid, {}) if gid else {}
+    custom_en = custom.get("text_en", "").strip()
+    custom_ku = custom.get("text_ku", "").strip()
+    if custom_en or custom_ku:
+        blocks = []
+        if custom_en:
+            blocks.append("🇬🇧 " + custom_en)
+        if custom_ku:
+            blocks.append("🇮🇶 " + custom_ku)
+        description = "\n\n──────────────────────\n\n".join(blocks)
+    else:
+        description = (
             "🇬🇧 **Need help? Create a ticket!**\n"
             "🇮🇶 **بێنویست بە یارمەتیە؟ تیکەتێک دروست بکە!**\n\n"
             "──────────────────────\n\n"
@@ -8465,7 +8613,11 @@ def build_ticket_panel_embed(guild_name: str, icon_url: str = None) -> discord.E
             "• ڕاپۆرتکردنی پێشێلکاری یاساکان\n\n"
             "──────────────────────\n"
             f"*{guild_name} | پشتگیری بیشەی 24/7*"
-        ),
+        )
+    embed = discord.Embed(
+        color=0xFFD700,
+        title=f"🎫 {guild_name} — پشتگیری | Support",
+        description=description,
         timestamp=datetime.datetime.utcnow(),
     )
     embed.set_footer(text=f"{guild_name} Support System")
@@ -8474,11 +8626,13 @@ def build_ticket_panel_embed(guild_name: str, icon_url: str = None) -> discord.E
     return embed
 
 
-def build_ticket_panel_embed_en(guild_name: str, icon_url: str = None) -> discord.Embed:
-    embed = discord.Embed(
-        color=0xFFD700,
-        title=f"🎫 {guild_name} — Support",
-        description=(
+def build_ticket_panel_embed_en(guild_name: str, icon_url: str = None, gid: str = None) -> discord.Embed:
+    custom = ticket_panel_text_map.get(gid, {}) if gid else {}
+    custom_en = custom.get("text_en", "").strip()
+    if custom_en:
+        description = "🇬🇧 " + custom_en
+    else:
+        description = (
             "🇬🇧 **Need help? Create a ticket!**\n\n"
             "──────────────────────\n\n"
             "Click the button below to open a support ticket.\n"
@@ -8490,7 +8644,11 @@ def build_ticket_panel_embed_en(guild_name: str, icon_url: str = None) -> discor
             "• Report rule violations\n\n"
             "──────────────────────\n"
             f"*{guild_name} | 24/7 Support*"
-        ),
+        )
+    embed = discord.Embed(
+        color=0xFFD700,
+        title=f"🎫 {guild_name} — Support",
+        description=description,
         timestamp=datetime.datetime.utcnow(),
     )
     embed.set_footer(text=f"{guild_name} Support System")
@@ -8499,11 +8657,81 @@ def build_ticket_panel_embed_en(guild_name: str, icon_url: str = None) -> discor
     return embed
 
 
-def build_ticket_panel_embed_ku(guild_name: str, icon_url: str = None) -> discord.Embed:
+# ── Per-ticket welcome embed (shown inside a newly created ticket channel) ─────
+
+def build_ticket_welcome_embed(user_mention: str, user_avatar: str, guild_name: str, icon_url: str = None) -> discord.Embed:
     embed = discord.Embed(
         color=0xFFD700,
-        title=f"🎫 {guild_name} — پشتگیری",
+        title="🎫 Ticket",
         description=(
+            f"سڵاو {user_mention} 👋\n\n"
+            "🇬🇧 **Welcome!** This ticket has been automatically claimed by our staff team.\n"
+            "Use the buttons below to choose your language or submit your problem.\n\n"
+            "🇮🇶 **بەخێربێیت!** ئەم تیکەتە بە شێوەیەکی ئۆتۆماتیکی وەرگیراوە لەلایەن تیمی ستافەوە.\n"
+            "دوگمەکانی خوارەوە بەکاربهێنە بۆ هەڵبژاردنی زمان یان ناردنی کێشەکەت.\n\n"
+            "──────────────────────\n"
+            "🔒 To close this ticket, use the `!closeticket` command.\n"
+            "🔒 بۆ داخستنی تیکەت فەرمانی `!closeticket` بەکاربهێنە."
+        ),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    if user_avatar:
+        embed.set_thumbnail(url=user_avatar)
+    embed.set_footer(text=f"{guild_name} Support")
+    if icon_url:
+        embed.set_image(url=icon_url)
+    return embed
+
+
+def build_ticket_welcome_embed_en(user_mention: str, user_avatar: str, guild_name: str, icon_url: str = None) -> discord.Embed:
+    embed = discord.Embed(
+        color=0xFFD700,
+        title="🎫 Ticket",
+        description=(
+            f"Hey {user_mention} 👋\n\n"
+            "**Welcome!** This ticket has been automatically claimed by our staff team.\n"
+            "Use the buttons below to choose your language or submit your problem.\n\n"
+            "──────────────────────\n"
+            "🔒 To close this ticket, use the `!closeticket` command."
+        ),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    if user_avatar:
+        embed.set_thumbnail(url=user_avatar)
+    embed.set_footer(text=f"{guild_name} Support")
+    if icon_url:
+        embed.set_image(url=icon_url)
+    return embed
+
+
+def build_ticket_welcome_embed_ku(user_mention: str, user_avatar: str, guild_name: str, icon_url: str = None) -> discord.Embed:
+    embed = discord.Embed(
+        color=0xFFD700,
+        title="🎫 تیکەت",
+        description=(
+            f"سڵاو {user_mention} 👋\n\n"
+            "**بەخێربێیت!** ئەم تیکەتە بە شێوەیەکی ئۆتۆماتیکی وەرگیراوە لەلایەن تیمی ستافەوە.\n"
+            "دوگمەکانی خوارەوە بەکاربهێنە بۆ هەڵبژاردنی زمان یان ناردنی کێشەکەت.\n\n"
+            "──────────────────────\n"
+            "🔒 بۆ داخستنی تیکەت فەرمانی `!closeticket` بەکاربهێنە."
+        ),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    if user_avatar:
+        embed.set_thumbnail(url=user_avatar)
+    embed.set_footer(text=f"{guild_name} Support")
+    if icon_url:
+        embed.set_image(url=icon_url)
+    return embed
+
+
+def build_ticket_panel_embed_ku(guild_name: str, icon_url: str = None, gid: str = None) -> discord.Embed:
+    custom = ticket_panel_text_map.get(gid, {}) if gid else {}
+    custom_ku = custom.get("text_ku", "").strip()
+    if custom_ku:
+        description = "🇮🇶 " + custom_ku
+    else:
+        description = (
             "🇮🇶 **بێنویست بە یارمەتیە؟ تیکەتێک دروست بکە!**\n\n"
             "──────────────────────\n\n"
             "کرتە بکەرە لەسەر دوگمەکە بۆ کردنەوەی تیکەتی پشتگیری.\n"
@@ -8515,7 +8743,11 @@ def build_ticket_panel_embed_ku(guild_name: str, icon_url: str = None) -> discor
             "• ڕاپۆرتکردنی پێشێلکاری یاساکان\n\n"
             "──────────────────────\n"
             f"*{guild_name} | پشتگیری بیشەی 24/7*"
-        ),
+        )
+    embed = discord.Embed(
+        color=0xFFD700,
+        title=f"🎫 {guild_name} — پشتگیری",
+        description=description,
         timestamp=datetime.datetime.utcnow(),
     )
     embed.set_footer(text=f"{guild_name} Support System")
@@ -8660,6 +8892,7 @@ class LanguageSelectView(discord.ui.View):
         icon_url: str = None,
         mode: str = "panel",
         user_avatar: str = None,
+        user_mention: str = None,
     ):
         super().__init__(timeout=60)
         self.panel_message_id = panel_message_id
@@ -8668,6 +8901,7 @@ class LanguageSelectView(discord.ui.View):
         self.icon_url         = icon_url
         self.mode             = mode
         self.user_avatar      = user_avatar
+        self.user_mention     = user_mention
 
     async def _switch(self, interaction: discord.Interaction, lang: str):
         ch = interaction.guild.get_channel(self.panel_channel_id)
@@ -8681,6 +8915,13 @@ class LanguageSelectView(discord.ui.View):
                         "both": build_staff_app_embed,
                     }
                     embed = fns[lang](self.guild_name, self.user_avatar, self.icon_url)
+                elif self.mode == "ticket_welcome":
+                    fns = {
+                        "en":   build_ticket_welcome_embed_en,
+                        "ku":   build_ticket_welcome_embed_ku,
+                        "both": build_ticket_welcome_embed,
+                    }
+                    embed = fns[lang](self.user_mention, self.user_avatar, self.guild_name, self.icon_url)
                 elif self.mode == "rules":
                     gid = str(interaction.guild.id)
                     s   = rules_settings.get(gid, {})
@@ -8698,7 +8939,7 @@ class LanguageSelectView(discord.ui.View):
                         "ku":   build_ticket_panel_embed_ku,
                         "both": build_ticket_panel_embed,
                     }
-                    embed = fns[lang](self.guild_name, self.icon_url)
+                    embed = fns[lang](self.guild_name, self.icon_url, str(interaction.guild.id))
                 await msg.edit(embed=embed)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
@@ -8750,11 +8991,11 @@ class SubmitStaffModal(discord.ui.Modal, title="📋 داواکاریی ستاف
         max_length=500,
         style=discord.TextStyle.paragraph,
     )
-    staff_server_tag = discord.ui.TextInput(
-        label="تاگی سێرڤەر؟ | Server Tag?",
-        placeholder="بەڵێ / نەخێر · Yes / No — explain briefly",
-        max_length=200,
-        style=discord.TextStyle.short,
+    staff_tag_reklam = discord.ui.TextInput(
+        label="تاگی سێرڤەر + ٣ ڕیکلامی ڕۆژانە؟ | Tag + 3 Daily Reklams?",
+        placeholder="Server Tag Yes/No + Can you do 3 reklams every day? Yes/No | تاگ + دەتوانیت ٣ ڕیکلامی ڕۆژانە بکەیت؟",
+        max_length=300,
+        style=discord.TextStyle.paragraph,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -8777,7 +9018,7 @@ class SubmitStaffModal(discord.ui.Modal, title="📋 داواکاریی ستاف
         embed.add_field(name="2️⃣ ئەزموون | Experience",          value=self.staff_experience.value  or "—", inline=False)
         embed.add_field(name="3️⃣ کاتژمێری چالاکی | Active",      value=self.staff_active.value      or "—", inline=True)
         embed.add_field(name="4️⃣ بۆچی ستاف؟ | Why Staff?",       value=self.staff_why.value         or "—", inline=False)
-        embed.add_field(name="5️⃣ تاگی سێرڤەر؟ | Server Tag?",   value=self.staff_server_tag.value  or "—", inline=False)
+        embed.add_field(name="5️⃣ تاگی سێرڤەر + ٣ ڕیکلامی ڕۆژانە | Tag + 3 Daily Reklams", value=self.staff_tag_reklam.value or "—", inline=False)
         if guild and guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
         embed.set_footer(
@@ -8979,24 +9220,12 @@ class TicketPanelView(discord.ui.View):
             save_open_tickets()
 
             # ── Build the welcome embed ───────────────────────────────────────
-            ticket_embed = discord.Embed(
-                color=0xFFD700,
-                title="🎫 Ticket — " + interaction.user.display_name,
-                description=(
-                    "سڵاو " + interaction.user.mention + " 👋\n\n"
-                    "🇬🇧 Welcome! Please describe your issue and a staff member will assist you shortly.\n\n"
-                    "🇮🇶 بەخێربێیت! تکایە کێشەکەت شرۆڤە بکە و ئەندامێکی تیم زووترین کات یارمەتیت دەدات.\n\n"
-                    "──────────────────────\n"
-                    "🔒 To close this ticket, click the button below.\n"
-                    "🔒 بۆ داخستنی تیکەت، دوگمەکە دابگرە."
-                ),
-                timestamp=datetime.datetime.utcnow(),
+            ticket_embed = build_ticket_welcome_embed(
+                interaction.user.mention,
+                interaction.user.display_avatar.url,
+                guild.name,
+                _guild_icon_url(guild),
             )
-            ticket_embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            ticket_embed.set_footer(text=guild.name + " Support")
-            icon = _guild_icon_url(guild)
-            if icon:
-                ticket_embed.set_image(url=icon)
 
             mention_str = interaction.user.mention
             if staff_rid:
@@ -9013,7 +9242,10 @@ class TicketPanelView(discord.ui.View):
                 "✅ تیکەتەکەت دروستکرا | Your ticket has been created: " + ticket_ch.mention,
                 ephemeral=True,
             )
-            await ticket_log(guild, "🎫 **Ticket opened** by " + interaction.user.mention + " → " + ticket_ch.mention)
+            await ticket_log(
+                guild,
+                "🎫 **Ticket opened (auto-claimed)** by " + interaction.user.mention + " → " + ticket_ch.mention,
+            )
 
         except Exception as e:
             try:
@@ -9161,58 +9393,136 @@ class TicketPanelView(discord.ui.View):
 
 # ── Ticket control view ───────────────────────────────────────────────────────
 
+class TicketProblemModal(discord.ui.Modal, title="📝 Submit Problem | کێشەکەت بنووسە"):
+    problem_text = discord.ui.TextInput(
+        label="کێشەکەت چیە؟ | What's your problem?",
+        placeholder="Describe your issue in detail... | کێشەکەت بە وردی شرۆڤە بکە...",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            color=0x5865F2,
+            title="📝 داواکاری/کێشە نێردرا | Problem Reported",
+            description=self.problem_text.value,
+            timestamp=datetime.datetime.utcnow(),
+        )
+        embed.set_author(
+            name=f"{interaction.user.display_name} ({interaction.user})",
+            icon_url=interaction.user.display_avatar.url,
+        )
+        try:
+            await interaction.response.send_message(embed=embed)
+        except Exception:
+            try:
+                await interaction.response.send_message(
+                    "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+                )
+            except Exception:
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message(
+                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+            )
+        except Exception:
+            pass
+
+
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="🔒 Close Ticket | داخستنی تیکەت",
-        style=discord.ButtonStyle.danger,
-        custom_id="ticket:close",
+        label="🌐 Choose Language | زمان هەڵبژێرە",
+        style=discord.ButtonStyle.secondary,
+        custom_id="ticket:welcome_language",
+        row=0,
     )
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def choose_language(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = LanguageSelectView(
+            panel_message_id=interaction.message.id,
+            panel_channel_id=interaction.channel_id,
+            guild_name=interaction.guild.name,
+            icon_url=_guild_icon_url(interaction.guild),
+            mode="ticket_welcome",
+            user_avatar=interaction.user.display_avatar.url,
+            user_mention=interaction.user.mention,
+        )
         await interaction.response.send_message(
-            "🔒 داخستنی تیکەت لە 5 چرکەدا... | Closing ticket in 5 seconds...",
-            ephemeral=False,
+            "🌐 **زمانێک هەڵبژێرە | Choose the ticket language:**",
+            view=view,
+            ephemeral=True,
         )
-        for (gid, uid), cid in list(open_tickets_map.items()):
-            if int(cid) == interaction.channel_id:
-                open_tickets_map.pop((gid, uid), None)
-                break
-        save_open_tickets()
-        await ticket_log(
-            interaction.guild,
-            "🔒 **Ticket closed** " + interaction.channel.mention + " by " + interaction.user.mention,
-        )
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete(reason="Ticket closed")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
 
     @discord.ui.button(
-        label="✋ Claim Ticket | وەرگرتنی تیکەت",
-        style=discord.ButtonStyle.primary,
-        custom_id="ticket:claim",
+        label="📝 Submit Problem | کێشەکەت بنووسە",
+        style=discord.ButtonStyle.success,
+        custom_id="ticket:submit_problem",
+        row=0,
     )
-    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = get_ticket_cfg(interaction.guild.id)
-        staff_rid = cfg.get("staff_role_id")
-        if staff_rid:
-            staff_role = interaction.guild.get_role(int(staff_rid))
-            if staff_role and staff_role not in interaction.user.roles:
-                return await interaction.response.send_message(
-                    "❌ تەنها ستاف دەتوانێت تیکەت وەربگرێت | Only staff can claim tickets.",
-                    ephemeral=True,
+    async def submit_problem(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(TicketProblemModal())
+        except Exception as exc:
+            try:
+                await interaction.response.send_message(
+                    f"❌ هەڵەیەک ڕوویدا. | An error occurred: `{exc}`", ephemeral=True
                 )
-        await interaction.response.send_message(
-            "✋ ئەم تیکەتە وەرگیرا لەلایەن | This ticket has been claimed by "
-            + interaction.user.mention
+            except Exception:
+                pass
+
+
+@bot.command(name="closeticket", aliases=["close"])
+async def closeticket_cmd(ctx):
+    """Close the ticket in the current channel. Usable by the ticket owner or staff/admins."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+
+    key = None
+    for (gid, uid), cid in list(open_tickets_map.items()):
+        if int(cid) == ctx.channel.id:
+            key = (gid, uid)
+            break
+
+    if key is None:
+        return await ctx.send(
+            "❌ ئەمە کەناڵی تیکەت نییە. | This is not a ticket channel.", delete_after=10
         )
-        await ticket_log(
-            interaction.guild,
-            "✋ **Ticket claimed** " + interaction.channel.mention + " by " + interaction.user.mention,
+
+    gid, uid = key
+    is_owner = str(ctx.author.id) == uid
+    is_staff = ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.manage_messages
+    cfg = get_ticket_cfg(ctx.guild.id)
+    staff_rid = cfg.get("staff_role_id")
+    if staff_rid and not is_staff:
+        staff_role = ctx.guild.get_role(int(staff_rid))
+        if staff_role and staff_role in ctx.author.roles:
+            is_staff = True
+
+    if not (is_owner or is_staff):
+        return await ctx.send(
+            "❌ تەنها خاوەنی تیکەت یان ستاف دەتوانێت تیکەت دابخات. | Only the ticket owner or staff can close this ticket.",
+            delete_after=10,
         )
+
+    await ctx.send(
+        "🔒 داخستنی تیکەت لە 5 چرکەدا... | Closing ticket in 5 seconds...",
+    )
+    open_tickets_map.pop(key, None)
+    save_open_tickets()
+    await ticket_log(
+        ctx.guild,
+        "🔒 **Ticket closed** " + ctx.channel.mention + " by " + ctx.author.mention,
+    )
+    await asyncio.sleep(5)
+    try:
+        await ctx.channel.delete(reason="Ticket closed")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 # ── Ticket setup commands ─────────────────────────────────────────────────────
@@ -9225,9 +9535,10 @@ async def setpanel(ctx, channel: discord.TextChannel = None):
     target = channel or ctx.channel
     cfg = ticket_settings.setdefault(str(ctx.guild.id), {})
     cfg["panel_channel_id"] = target.id
+    embed = build_ticket_panel_embed(ctx.guild.name, _guild_icon_url(ctx.guild), str(ctx.guild.id))
+    panel_msg = await target.send(embed=embed, view=TicketPanelView())
+    cfg["panel_message_id"] = panel_msg.id
     save_ticket_settings()
-    embed = build_ticket_panel_embed(ctx.guild.name, _guild_icon_url(ctx.guild))
-    await target.send(embed=embed, view=TicketPanelView())
     if target != ctx.channel:
         await ctx.send(
             "✅ پانێلی تیکەت نێردرا بۆ " + target.mention + " | Ticket panel sent to " + target.mention + ".",
@@ -9237,6 +9548,105 @@ async def setpanel(ctx, channel: discord.TextChannel = None):
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
         pass
+
+class EditTicketPanelModal(discord.ui.Modal, title="✏️ Edit Ticket Panel Text"):
+    text_en = discord.ui.TextInput(
+        label="🇬🇧 English Text",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=False,
+    )
+    text_ku = discord.ui.TextInput(
+        label="🇮🇶 Kurdish Text | دەقی کوردی",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=False,
+    )
+
+    def __init__(self, current_en: str = "", current_ku: str = ""):
+        super().__init__()
+        self.text_en.default = current_en
+        self.text_ku.default = current_ku
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        if not gid:
+            return
+        en = self.text_en.value.strip()
+        ku = self.text_ku.value.strip()
+        save_ticket_panel_text(gid, en, ku)
+
+        # Try to live-update the posted panel, if we know where it is.
+        cfg = ticket_settings.get(gid, {})
+        panel_cid = cfg.get("panel_channel_id")
+        panel_mid = cfg.get("panel_message_id")
+        updated = False
+        if panel_cid and panel_mid:
+            ch = interaction.guild.get_channel(int(panel_cid))
+            if ch:
+                try:
+                    msg = await ch.fetch_message(int(panel_mid))
+                    new_embed = build_ticket_panel_embed(interaction.guild.name, _guild_icon_url(interaction.guild), gid)
+                    await msg.edit(embed=new_embed)
+                    updated = True
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
+        msg_text = "✅ دەقی پانێلی تیکەت نوێکرایەوە! | Ticket panel text updated!"
+        if updated:
+            msg_text += " ✅ Live panel refreshed."
+        else:
+            msg_text += " Use `!setpanel` to (re)post the panel with the new text."
+        await interaction.response.send_message(msg_text, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message(
+                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+            )
+        except Exception:
+            pass
+
+
+class _EditTicketPanelLauncherView(discord.ui.View):
+    """One-shot view that opens the edit modal (a command can't open a modal directly)."""
+    def __init__(self, current_en: str, current_ku: str):
+        super().__init__(timeout=60)
+        self.current_en = current_en
+        self.current_ku = current_ku
+
+    @discord.ui.button(label="✏️ Edit Text | دەقی بگۆڕە", style=discord.ButtonStyle.primary)
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ تەنها ئەدمین دەتوانێت. | Only administrators can do this.", ephemeral=True
+            )
+        await interaction.response.send_modal(
+            EditTicketPanelModal(self.current_en, self.current_ku)
+        )
+        self.stop()
+
+
+@bot.command(name="editticketpanel")
+@commands.has_permissions(administrator=True)
+async def editticketpanel_cmd(ctx):
+    """Edit the text shown on the ticket panel (English + Kurdish)."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    current = ticket_panel_text_map.get(gid, {})
+    await ctx.send(
+        "✏️ کرتە بکە لەسەر دوگمەکە بۆ گۆڕینی دەقی پانێلی تیکەت | Click the button to edit the ticket panel text.",
+        view=_EditTicketPanelLauncherView(current.get("text_en", ""), current.get("text_ku", "")),
+        delete_after=60,
+    )
+
+
+@editticketpanel_cmd.error
+async def editticketpanel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ تەنها ئەدمین دەتوانێت ئەم فەرمانە بەکاربێنێت. | Only administrators can use this command.")
+
 
 @bot.command(name="setstaffrole", aliases=["ticketstaffrole"])
 @commands.has_permissions(administrator=True)
@@ -11622,6 +12032,336 @@ async def setantichannel_cmd(ctx, channel: discord.TextChannel = None):
     )
     await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --- VERIFY SYSTEM ---
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verify_panel_embed(guild_name: str, icon_url: str = None) -> discord.Embed:
+    embed = discord.Embed(
+        color=0x57F287,
+        title="✅ پشتڕاستکردنەوە | Verification",
+        description=(
+            "🇬🇧 **Welcome!** Click the button below to verify yourself and unlock access to the server.\n\n"
+            "🇮🇶 **بەخێربێیت!** کرتە بکە لەسەر دوگمەکە بۆ پشتڕاستکردنەوەی خۆت و کردنەوەی سێرڤەر."
+        ),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    embed.set_footer(text=f"{guild_name} · Verification System")
+    if icon_url:
+        embed.set_thumbnail(url=icon_url)
+    return embed
+
+
+class VerifyPanelView(discord.ui.View):
+    """Persistent verify button — survives restarts."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="✅ Verify | پشتڕاستکردنەوە",
+        style=discord.ButtonStyle.success,
+        custom_id="verify:click",
+    )
+    async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        gid = str(guild.id)
+        cfg = verify_settings_map.get(gid)
+        if not cfg or not cfg.get("role_id"):
+            return await interaction.followup.send(
+                "❌ هیچ ڕۆڵێکی پشتڕاستکردنەوە دانەنراوە. ئەدمینێک بابکات `!verify`.\n"
+                "No verification role has been set up. An admin needs to run `!verify`.",
+                ephemeral=True,
+            )
+
+        role = guild.get_role(int(cfg["role_id"]))
+        if not role:
+            return await interaction.followup.send(
+                "❌ ڕۆڵی پشتڕاستکردنەوە نەدۆزرایەوە. تکایە ئەدمینێک ئاگادار بکەوە.\n"
+                "The verification role no longer exists. Please tell an admin.",
+                ephemeral=True,
+            )
+
+        if role in interaction.user.roles:
+            return await interaction.followup.send(
+                "✅ تۆ پێشتر پشتڕاستکراوی. | You're already verified!",
+                ephemeral=True,
+            )
+
+        try:
+            await interaction.user.add_roles(role, reason="Self-verification")
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ بۆتەکە مووچەی پێویستی نییە بۆ دانی ڕۆڵ. تکایە دڵنیابەوە بۆتەکە **Manage Roles** هەیە "
+                "و ڕیزبەندی ڕۆڵی بۆت لەسەری ڕۆڵی پشتڕاستکردنەوەیە.\n"
+                "The bot lacks permission to assign that role. Make sure it has **Manage Roles** and its "
+                "role is positioned above the verification role.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            return await interaction.followup.send(f"❌ هەڵە: `{e}`", ephemeral=True)
+
+        await interaction.followup.send(
+            "🎉 پشتڕاستکراویت! بەخێربێیت. | You are now verified! Welcome. 🎉",
+            ephemeral=True,
+        )
+
+
+class VerifySetupView(discord.ui.View):
+    """Admin-only setup view: pick the role to grant on verification."""
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=120)
+        self.channel_id = channel_id
+        self.add_item(self._RoleDropdown(channel_id))
+
+    class _RoleDropdown(discord.ui.RoleSelect):
+        def __init__(self, channel_id: int):
+            super().__init__(
+                placeholder="ڕۆڵی پشتڕاستکردنەوە هەڵبژێرە | Select the verification role",
+                min_values=1,
+                max_values=1,
+            )
+            self.channel_id = channel_id
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                return await interaction.response.send_message(
+                    "❌ تەنها ئەدمین دەتوانێت. | Only administrators can do this.", ephemeral=True
+                )
+            role = self.values[0]
+            guild = interaction.guild
+            save_verify_settings(guild.id, role.id, self.channel_id)
+            channel = guild.get_channel(self.channel_id)
+            embed = _verify_panel_embed(guild.name, _guild_icon_url(guild))
+            await channel.send(embed=embed, view=VerifyPanelView())
+            self.view.stop()
+            await interaction.response.edit_message(
+                content=(
+                    f"✅ ڕۆڵی پشتڕاستکردنەوە دانرا: {role.mention}\n"
+                    f"پانێلی پشتڕاستکردنەوە نێردرا بۆ {channel.mention}.\n\n"
+                    f"Verification role set to {role.mention} and the panel was posted in {channel.mention}."
+                ),
+                embed=None,
+                view=None,
+            )
+
+
+@bot.command(name="verify", aliases=["setverify", "verifysetup"])
+@commands.has_permissions(administrator=True)
+async def verify_cmd(ctx, channel: discord.TextChannel = None):
+    """Set up (or re-post) the verification panel. Pick a role, then members can self-verify."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+
+    if not ctx.guild.me.guild_permissions.manage_roles:
+        return await ctx.send(
+            "❌ بۆتەکە پێویستی بە **Manage Roles** هەیە بۆ ئەم فەرمانە.\n"
+            "The bot needs the **Manage Roles** permission for verification to work."
+        )
+
+    target = channel or ctx.channel
+    gid = str(ctx.guild.id)
+    cfg = verify_settings_map.get(gid)
+
+    if cfg and cfg.get("role_id"):
+        role = ctx.guild.get_role(int(cfg["role_id"]))
+        if role:
+            save_verify_settings(ctx.guild.id, role.id, target.id)
+            embed = _verify_panel_embed(ctx.guild.name, _guild_icon_url(ctx.guild))
+            await target.send(embed=embed, view=VerifyPanelView())
+            if target != ctx.channel:
+                await ctx.send(f"✅ پانێلی پشتڕاستکردنەوە نێردرا بۆ {target.mention}.", delete_after=10)
+            try:
+                await ctx.message.delete()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            return
+
+    await ctx.send(
+        "⚙️ ڕۆڵێک هەڵبژێرە کە بە ئەندامان دەدرێت کاتێک خۆیان پشتڕاست دەکەنەوە.\n"
+        "Select the role that should be given to members when they verify themselves.",
+        view=VerifySetupView(target.id),
+    )
+
+
+@verify_cmd.error
+async def verify_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ تەنها ئەدمین دەتوانێت ئەم فەرمانە بەکاربێنێت. | Only administrators can use this command.")
+    elif isinstance(error, commands.ChannelNotFound):
+        await ctx.send("❌ کەناڵ نەدۆزرایەوە. | Channel not found.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --- EVENT SPEED PING SYSTEM ---
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _eventspeed_status_embed(gid: str, guild_name: str) -> discord.Embed:
+    cfg = eventspeed_settings_map.get(gid, {})
+    text = cfg.get("text", "")
+    role_ids = cfg.get("role_ids", [])
+    role_text = (", ".join(f"<@&{r}>" for r in role_ids) if role_ids else "هیچ | None")
+    embed = discord.Embed(
+        color=0x5865F2,
+        title="⚡ دانانی ئیڤێنت سپید | Event Speed Setup",
+        description=(
+            f"**دەقی ئێستا | Current Text:**\n{text or '_هیچ دانەنراوە | Not set yet_'}\n\n"
+            f"**ڕۆڵەکان | Roles:** {role_text}\n\n"
+            "بەکاربردنی `{role}` لە دەقەکەدا شوێنی پینگی ڕۆڵەکان دەگرێتەوە.\n"
+            "Use `{role}` inside your text — it will be replaced with the role pings."
+        ),
+    )
+    embed.set_footer(text=guild_name)
+    return embed
+
+
+class EventSpeedEditTextModal(discord.ui.Modal, title="✏️ Edit Event Speed Text"):
+    speed_text = discord.ui.TextInput(
+        label="دەق | Text (use {role} for the ping)",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=True,
+    )
+
+    def __init__(self, current_text: str = ""):
+        super().__init__()
+        self.speed_text.default = current_text
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        if not gid:
+            return
+        save_eventspeed_settings(gid, text=self.speed_text.value.strip())
+        await interaction.response.send_message(
+            "✅ دەقی ئیڤێنت سپید نوێکرایەوە! | Event Speed text updated! ⚡\n"
+            "Use `!eventspeedpanel` to post it.",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message(
+                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+            )
+        except Exception:
+            pass
+
+
+class EventSpeedRoleSelectView(discord.ui.View):
+    """Standalone ephemeral view holding just the role picker."""
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(self._RoleDropdown())
+
+    class _RoleDropdown(discord.ui.RoleSelect):
+        def __init__(self):
+            super().__init__(
+                placeholder="ڕۆڵەکان هەڵبژێرە (چەند ڕۆڵێک بتەوێت) | Pick as many roles as you want",
+                min_values=1,
+                max_values=25,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                return await interaction.response.send_message(
+                    "❌ تەنها ئەدمین دەتوانێت. | Only administrators can do this.", ephemeral=True
+                )
+            role_ids = [r.id for r in self.values]
+            save_eventspeed_settings(str(interaction.guild.id), role_ids=role_ids)
+            role_text = ", ".join(r.mention for r in self.values)
+            self.view.stop()
+            await interaction.response.edit_message(
+                content=f"✅ ڕۆڵەکان دانران: {role_text}\n\nRoles saved: {role_text}",
+                view=None,
+            )
+
+
+class EventSpeedSetupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="✏️ Edit Text | دەق بگۆڕە", style=discord.ButtonStyle.primary, row=0)
+    async def edit_text_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ تەنها ئەدمین دەتوانێت. | Only administrators can do this.", ephemeral=True
+            )
+        gid = str(interaction.guild.id)
+        current = eventspeed_settings_map.get(gid, {}).get("text", "")
+        await interaction.response.send_modal(EventSpeedEditTextModal(current))
+
+    @discord.ui.button(label="🎭 Choose Roles | ڕۆڵ هەڵبژێرە", style=discord.ButtonStyle.secondary, row=0)
+    async def choose_roles_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ تەنها ئەدمین دەتوانێت. | Only administrators can do this.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            "🎭 ڕۆڵەکان هەڵبژێرە | Select the roles:",
+            view=EventSpeedRoleSelectView(),
+            ephemeral=True,
+        )
+
+
+@bot.command(name="seteventspeed")
+@commands.has_permissions(administrator=True)
+async def seteventspeed_cmd(ctx):
+    """Configure the Event Speed announcement: edit its text and pick which roles get pinged."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    await ctx.send(embed=_eventspeed_status_embed(gid, ctx.guild.name), view=EventSpeedSetupView())
+
+
+@seteventspeed_cmd.error
+async def seteventspeed_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ تەنها ئەدمین دەتوانێت ئەم فەرمانە بەکاربێنێت. | Only administrators can use this command.")
+
+
+@bot.command(name="eventspeedpanel")
+@commands.has_permissions(administrator=True)
+async def eventspeedpanel_cmd(ctx):
+    """Post the configured Event Speed announcement, replacing {role} with the configured role pings."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    cfg = eventspeed_settings_map.get(gid, {})
+    text = cfg.get("text", "").strip()
+    role_ids = cfg.get("role_ids", [])
+
+    if not text:
+        return await ctx.send(
+            "❌ هیچ دەقێک دانەنراوە. یەکەم جار `!seteventspeed` بەکاربهێنە.\n"
+            "❌ No text has been set yet. Run `!seteventspeed` first."
+        )
+
+    role_mentions = " ".join(f"<@&{r}>" for r in role_ids)
+    final_text = text.replace("{role}", role_mentions)
+
+    await ctx.send(
+        final_text,
+        allowed_mentions=discord.AllowedMentions(roles=True, everyone=False, users=True),
+    )
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+@eventspeedpanel_cmd.error
+async def eventspeedpanel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ تەنها ئەدمین دەتوانێت ئەم فەرمانە بەکاربێنێت. | Only administrators can use this command.")
+
 @setantichannel_cmd.error
 async def setantichannel_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -11654,7 +12394,7 @@ class StaffDailyRoleSelect(discord.ui.RoleSelect):
             description=(
                 f"**ڕۆڵەکانی پینگکراو:**\n{role_mentions}\n\n"
                 f"**کەناڵ:** {ch_mention}\n\n"
-                "هەموو ڕۆژێک لە کاتژمێڕ **٩ ئێوارە** دەیلی دەنێردرێت."
+                "هەموو ڕۆژێک لە کاتژمێڕ **٦ ئێوارە** دەیلی دەنێردرێت."
             ),
         )
         embed.set_footer(text=f"Set by {interaction.user.display_name}")
@@ -11748,7 +12488,7 @@ async def setupstaffdaily_cmd(ctx):
             f"**کەناڵی ئێستا | Current Channel:** {ch_mention}\n"
             f"**رۆڵەکانی ئێستا | Current Roles:** {existing_text}\n\n"
             "لەخوارەوە رۆڵەکانی ستافت هەڵبژێرە کە دەتەوێت ڕۆژانە پینگ بکرێن.\n"
-            "Pick the staff roles below that should be pinged every day at 9 PM UTC."
+            "Pick the staff roles below that should be pinged every day at 6 PM Iraq time."
         ),
     )
     embed.set_footer(text=f"{ctx.guild.name} · Staff Daily Setup")
@@ -11788,7 +12528,7 @@ async def staff_daily(ctx):
 @staff_group.command(name="setchannel")
 @commands.has_permissions(manage_guild=True)
 async def staff_set_channel(ctx, channel: discord.TextChannel = None):
-    """Set the channel for automatic 9 PM staff daily pings."""
+    """Set the channel for automatic 6 PM Iraq time staff daily pings."""
     if ctx.guild is None:
         return await ctx.send("Server only. | تەنها لە سێرڤەر.")
     target = channel or ctx.channel
@@ -11798,7 +12538,7 @@ async def staff_set_channel(ctx, channel: discord.TextChannel = None):
         color=0x57F287,
         title="✅ کەناڵی دەیلی دانراو | Daily Channel Set",
         description=(
-            f"هەموو رۆژێک لە کاتژمێر **٩ ئێوارە** دەیلیەکان دەنێردرێن بۆ {target.mention}.\n\n"
+            f"هەموو رۆژێک لە کاتژمێر **٦ ئێوارە** دەیلیەکان دەنێردرێن بۆ {target.mention}.\n\n"
             f"بۆ تاقیکردنەوە: `!staff daily`"
         ),
     )
@@ -12581,19 +13321,19 @@ class StaffDoneView(discord.ui.View):
 
         # Post a brand-new panel with a fresh persistent button
         try:
-            fresh_embed = discord.Embed(
-                color=0x57F287,
-                title="📣 دەیلی ستاف | Staff Daily",
-                description=(
-                    "سڵاو! 👋\n\n"
-                    "**خۆشحاڵبووین بینینت چالاکیت دەکەیت! 🌟**\n"
-                    "دڵنیا بە کە ئەمڕۆ ڕیکلامەکانت ئەنجام دەدەیت — مەیەوە بیجێبهێڵیت!\n\n"
-                    "**Hey! Glad to see you doing your daily reklaams! 🌟**\n"
-                    "Make sure you won't forget to do them today!\n\n"
-                    "⬇️ کاتێک تەواوت کرد دەگمەی **Done** دابگرە.\n"
-                    "⬇️ When you're done, press **Done** below."
-                ),
+            gid = str(interaction.guild.id)
+            custom = staff_done_text_map.get(gid, {})
+            title = custom.get("title") or "📣 دەیلی ستاف | Staff Daily"
+            description = custom.get("description") or (
+                "سڵاو! 👋\n\n"
+                "**خۆشحاڵبووین بینینت چالاکیت دەکەیت! 🌟**\n"
+                "دڵنیا بە کە ئەمڕۆ ڕیکلامەکانت ئەنجام دەدەیت — مەیەوە بیجێبهێڵیت!\n\n"
+                "**Hey! Glad to see you doing your daily reklaams! 🌟**\n"
+                "Make sure you won't forget to do them today!\n\n"
+                "⬇️ کاتێک تەواوت کرد دەگمەی **Done** دابگرە.\n"
+                "⬇️ When you're done, press **Done** below."
             )
+            fresh_embed = discord.Embed(color=0x57F287, title=title, description=description)
             if interaction.guild.icon:
                 fresh_embed.set_thumbnail(url=interaction.guild.icon.url)
             fresh_embed.set_footer(text=f"{interaction.guild.name} · Staff Team")
@@ -12630,19 +13370,19 @@ async def staffdone_cmd(ctx):
     if ctx.guild is None:
         return await ctx.send("Server only. | تەنها لە سێرڤەر.")
 
-    embed = discord.Embed(
-        color=0x57F287,
-        title="📣 دەیلی ستاف | Staff Daily",
-        description=(
-            "سڵاو! 👋\n\n"
-            "**خۆشحاڵبووین بینینت چالاکیت دەکەیت! 🌟**\n"
-            "دڵنیا بە کە ئەمڕۆ ڕیکلامەکانت ئەنجام دەدەیت — مەیەوە بیجێبهێڵیت!\n\n"
-            "**Hey! Glad to see you doing your daily reklaams! 🌟**\n"
-            "Make sure you won't forget to do them today!\n\n"
-            "⬇️ کاتێک تەواوت کرد دەگمەی **Done** دابگرە.\n"
-            "⬇️ When you're done, press **Done** below."
-        ),
+    gid = str(ctx.guild.id)
+    custom = staff_done_text_map.get(gid, {})
+    title = custom.get("title") or "📣 دەیلی ستاف | Staff Daily"
+    description = custom.get("description") or (
+        "سڵاو! 👋\n\n"
+        "**خۆشحاڵبووین بینینت چالاکیت دەکەیت! 🌟**\n"
+        "دڵنیا بە کە ئەمڕۆ ڕیکلامەکانت ئەنجام دەدەیت — مەیەوە بیجێبهێڵیت!\n\n"
+        "**Hey! Glad to see you doing your daily reklaams! 🌟**\n"
+        "Make sure you won't forget to do them today!\n\n"
+        "⬇️ کاتێک تەواوت کرد دەگمەی **Done** دابگرە.\n"
+        "⬇️ When you're done, press **Done** below."
     )
+    embed = discord.Embed(color=0x57F287, title=title, description=description)
     embed.set_footer(text=f"{ctx.guild.name} · Staff Team")
     if ctx.guild.icon:
         embed.set_thumbnail(url=ctx.guild.icon.url)
@@ -12653,6 +13393,84 @@ async def staffdone_cmd(ctx):
 async def staffdone_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ مووچەی Manage Server پێویستە. | You need Manage Server permission.")
+
+
+class EditStaffDoneModal(discord.ui.Modal, title="✏️ Edit Staff Done Text"):
+    done_title = discord.ui.TextInput(
+        label="Title | سەردێڕ",
+        style=discord.TextStyle.short,
+        max_length=256,
+        required=False,
+    )
+    done_description = discord.ui.TextInput(
+        label="Description | دەق",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=False,
+    )
+
+    def __init__(self, current_title: str = "", current_description: str = ""):
+        super().__init__()
+        self.done_title.default = current_title
+        self.done_description.default = current_description
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        if gid:
+            save_staff_done_text(gid, self.done_title.value.strip(), self.done_description.value.strip())
+        await interaction.response.send_message(
+            "✅ دەقی Staff Done نوێکرایەوە! | Staff Done text updated! 📣\n"
+            "Use `!staffdone` to post a fresh panel with the new text.",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message(
+                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
+            )
+        except Exception:
+            pass
+
+
+@bot.command(name="editstaffdone")
+@commands.has_permissions(administrator=True)
+async def editstaffdone_cmd(ctx):
+    """Edit the title/description text shown on the Staff Done panel."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    current = staff_done_text_map.get(gid, {})
+    await ctx.send(
+        "✏️ کرتە بکە لەسەر دوگمەکە بۆ گۆڕینی دەقی Staff Done | Click the button to edit the Staff Done text.",
+        view=_EditStaffDoneLauncherView(current.get("title", ""), current.get("description", "")),
+        delete_after=60,
+    )
+
+
+class _EditStaffDoneLauncherView(discord.ui.View):
+    """One-shot view that opens the edit modal (a command can't open a modal directly)."""
+    def __init__(self, current_title: str, current_description: str):
+        super().__init__(timeout=60)
+        self.current_title = current_title
+        self.current_description = current_description
+
+    @discord.ui.button(label="✏️ Edit Text | دەقی بگۆڕە", style=discord.ButtonStyle.primary)
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ تەنها ئەدمین دەتوانێت. | Only administrators can do this.", ephemeral=True
+            )
+        await interaction.response.send_modal(
+            EditStaffDoneModal(self.current_title, self.current_description)
+        )
+        self.stop()
+
+
+@editstaffdone_cmd.error
+async def editstaffdone_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ تەنها ئەدمین دەتوانێت ئەم فەرمانە بەکاربێنێت. | Only administrators can use this command.")
 
 
 @bot.command(name="setdonelog", aliases=["setdonelogchannel"])
