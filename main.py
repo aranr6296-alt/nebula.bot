@@ -8992,7 +8992,7 @@ class SubmitStaffModal(discord.ui.Modal, title="📋 داواکاریی ستاف
         style=discord.TextStyle.paragraph,
     )
     staff_tag_reklam = discord.ui.TextInput(
-        label="تاگی سێرڤەر + ٣ ڕیکلامی ڕۆژانە؟ | Tag + 3 Daily Reklams?",
+        label="تاگ + ٣ ڕیکلام | Tag + 3 Reklams?",
         placeholder="Server Tag Yes/No + Can you do 3 reklams every day? Yes/No | تاگ + دەتوانیت ٣ ڕیکلامی ڕۆژانە بکەیت؟",
         max_length=300,
         style=discord.TextStyle.paragraph,
@@ -12215,8 +12215,11 @@ def _eventspeed_status_embed(gid: str, guild_name: str) -> discord.Embed:
         description=(
             f"**دەقی ئێستا | Current Text:**\n{text or '_هیچ دانەنراوە | Not set yet_'}\n\n"
             f"**ڕۆڵەکان | Roles:** {role_text}\n\n"
-            "بەکاربردنی `{role}` لە دەقەکەدا شوێنی پینگی ڕۆڵەکان دەگرێتەوە.\n"
-            "Use `{role}` inside your text — it will be replaced with the role pings."
+            "بۆ هەر ڕۆڵێک شوێنکەوتنێکی جیاواز بەکاربهێنە: `{role1}` `{role2}` `{role3}` ... "
+            "بەپێی ڕیزبەندی هەڵبژاردنت.\n"
+            "Give each role its own placeholder: `{role1}` `{role2}` `{role3}` ... in the order "
+            "you picked them — place them anywhere in your text, on their own line if you like.\n"
+            "(`{role}` still works as a shortcut for *all* roles pinged together.)"
         ),
     )
     embed.set_footer(text=guild_name)
@@ -12225,7 +12228,8 @@ def _eventspeed_status_embed(gid: str, guild_name: str) -> discord.Embed:
 
 class EventSpeedEditTextModal(discord.ui.Modal, title="✏️ Edit Event Speed Text"):
     speed_text = discord.ui.TextInput(
-        label="دەق | Text (use {role} for the ping)",
+        label="دەق | Text",
+        placeholder="Use {role1} {role2} {role3}... one per selected role, anywhere in the text",
         style=discord.TextStyle.paragraph,
         max_length=1500,
         required=True,
@@ -12344,8 +12348,11 @@ async def eventspeedpanel_cmd(ctx):
             "❌ No text has been set yet. Run `!seteventspeed` first."
         )
 
+    final_text = text
+    for i, rid in enumerate(role_ids, start=1):
+        final_text = final_text.replace("{role" + str(i) + "}", f"<@&{rid}>")
     role_mentions = " ".join(f"<@&{r}>" for r in role_ids)
-    final_text = text.replace("{role}", role_mentions)
+    final_text = final_text.replace("{role}", role_mentions)
 
     await ctx.send(
         final_text,
