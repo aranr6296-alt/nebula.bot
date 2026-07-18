@@ -9,7 +9,8 @@ import math
 import datetime
 import re
 import asyncio
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import aiohttp
 import concurrent.futures as _cf
 import html as html_module
@@ -92,195 +93,281 @@ def load_guild_langs():
 
 
 
-# --- SQLITE DATABASE SETUP ---
-DB_FILE = "bot_data.db"
+# --- POSTGRESQL DATABASE SETUP ---
+# Set DATABASE_URL in your Railway environment variables.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+import re as _re_pg  # used inside wrapper
+
+def _pg_adapt_sql(sql: str) -> str:
+    """Convert SQLite-style SQL to PostgreSQL SQL at runtime."""
+    sql = sql.replace('?', '%s')
+    if _re_pg.search(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', sql, _re_pg.IGNORECASE):
+        sql = _re_pg.sub(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', 'INSERT INTO', sql, flags=_re_pg.IGNORECASE)
+        sql = sql.rstrip('; \n') + ' ON CONFLICT DO NOTHING'
+    return sql
+
+
+class _PGCursor:
+    """Wraps a psycopg2 RealDictCursor to behave like sqlite3's cursor."""
+    def __init__(self, pg_cur):
+        self._c = pg_cur
+
+    def __iter__(self):
+        return iter(self._c.fetchall())
+
+    def fetchone(self):
+        return self._c.fetchone()
+
+    def fetchall(self):
+        return self._c.fetchall()
+
+    def executescript(self, sql: str):
+        """Run multiple ;-separated statements (mirrors sqlite3 executescript)."""
+        for stmt in sql.split(';'):
+            s = stmt.strip()
+            if s:
+                self._c.execute(s)
+
+    def execute(self, sql: str, params=()):
+        self._c.execute(_pg_adapt_sql(sql), params or ())
+        return self
+
+
+class _PGWrapper:
+    """Thin sqlite3-compatible wrapper around a psycopg2 connection.
+
+    Handles:
+    • ? → %s placeholder conversion
+    • INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+    • Row access by column name (RealDictCursor)
+    • commit() / close() / context-manager protocol
+    """
+    def __init__(self, dsn: str):
+        self._conn = psycopg2.connect(dsn)
+        self._conn.autocommit = False
+
+    def cursor(self) -> _PGCursor:
+        return _PGCursor(self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor))
+
+    def execute(self, sql: str, params=()):
+        pg_cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        pg_cur.execute(_pg_adapt_sql(sql), params or ())
+        return _PGCursor(pg_cur)
+
+    def executemany(self, sql: str, seq):
+        pg_cur = self._conn.cursor()
+        pg_cur.executemany(_pg_adapt_sql(sql), seq)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def get_db() -> _PGWrapper:
+    return _PGWrapper(DATABASE_URL)
 
 def init_db():
     conn = get_db()
     c = conn.cursor()
     c.executescript("""
         CREATE TABLE IF NOT EXISTS xp_data (
-            guild_id INTEGER,
-            user_id INTEGER,
-            message_xp INTEGER DEFAULT 0,
-            voice_xp INTEGER DEFAULT 0,
+            guild_id BIGINT,
+            user_id BIGINT,
+            message_xp BIGINT DEFAULT 0,
+            voice_xp BIGINT DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS economy (
-            guild_id INTEGER,
-            user_id INTEGER,
-            wallet INTEGER DEFAULT 0,
-            bank INTEGER DEFAULT 0,
-            last_daily REAL DEFAULT 0,
-            last_weekly REAL DEFAULT 0,
-            last_work REAL DEFAULT 0,
-            last_beg REAL DEFAULT 0,
+            guild_id BIGINT,
+            user_id BIGINT,
+            wallet BIGINT DEFAULT 0,
+            bank BIGINT DEFAULT 0,
+            last_daily DOUBLE PRECISION DEFAULT 0,
+            last_weekly DOUBLE PRECISION DEFAULT 0,
+            last_work DOUBLE PRECISION DEFAULT 0,
+            last_beg DOUBLE PRECISION DEFAULT 0,
             inventory TEXT DEFAULT '[]',
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS warnings (
-            guild_id INTEGER,
-            user_id INTEGER,
-            count INTEGER DEFAULT 0,
+            guild_id BIGINT,
+            user_id BIGINT,
+            count BIGINT DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS afk_users (
-            guild_id INTEGER,
-            user_id INTEGER,
+            guild_id BIGINT,
+            user_id BIGINT,
             reason TEXT,
-            since REAL,
+            since DOUBLE PRECISION,
             old_nick TEXT,
             image_url TEXT,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS level_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS lucky_leaderboard (
-            guild_id INTEGER,
-            user_id INTEGER,
-            wins INTEGER DEFAULT 0,
-            total_guesses INTEGER DEFAULT 0,
-            best_guesses INTEGER DEFAULT 0,
+            guild_id BIGINT,
+            user_id BIGINT,
+            wins BIGINT DEFAULT 0,
+            total_guesses BIGINT DEFAULT 0,
+            best_guesses BIGINT DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS welcome_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS ticket_settings (
-            guild_id INTEGER PRIMARY KEY,
-            staff_role_id INTEGER,
-            category_id INTEGER,
-            log_channel_id INTEGER,
-            panel_channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            staff_role_id BIGINT,
+            category_id BIGINT,
+            log_channel_id BIGINT,
+            panel_channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS open_tickets (
-            guild_id INTEGER,
-            user_id INTEGER,
-            channel_id INTEGER,
+            guild_id BIGINT,
+            user_id BIGINT,
+            channel_id BIGINT,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS open_staff_apps (
-            guild_id INTEGER,
-            user_id INTEGER,
-            channel_id INTEGER,
+            guild_id BIGINT,
+            user_id BIGINT,
+            channel_id BIGINT,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS staff_submit_log_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS rules_settings (
-            guild_id  INTEGER PRIMARY KEY,
+            guild_id  BIGINT PRIMARY KEY,
             text_en   TEXT    DEFAULT '',
             text_ku   TEXT    DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS staff_daily_last_msg (
-            guild_id   INTEGER PRIMARY KEY,
-            message_id INTEGER
+            guild_id   BIGINT PRIMARY KEY,
+            message_id BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS warnings_log (
+            id           BIGSERIAL PRIMARY KEY,
+            guild_id     BIGINT,
+            user_id      BIGINT,
+            reason       TEXT    DEFAULT '',
+            moderator_id TEXT    DEFAULT '',
+            timestamp    BIGINT  DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS invite_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS invite_counts (
-            guild_id INTEGER,
-            user_id INTEGER,
-            total INTEGER DEFAULT 0,
-            left_count INTEGER DEFAULT 0,
+            guild_id BIGINT,
+            user_id BIGINT,
+            total BIGINT DEFAULT 0,
+            left_count BIGINT DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS apply_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS apply_questions (
-            guild_id  INTEGER NOT NULL,
-            slot      INTEGER NOT NULL,
+            guild_id  BIGINT NOT NULL,
+            slot      BIGINT NOT NULL,
             question  TEXT    NOT NULL,
             PRIMARY KEY (guild_id, slot)
         );
         CREATE TABLE IF NOT EXISTS apply_lang (
-            guild_id  INTEGER PRIMARY KEY,
+            guild_id  BIGINT PRIMARY KEY,
             lang      TEXT    NOT NULL DEFAULT 'both'
         );
         CREATE TABLE IF NOT EXISTS log_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS rr_panels (
-            guild_id INTEGER,
-            channel_id INTEGER,
-            message_id INTEGER PRIMARY KEY,
+            guild_id BIGINT,
+            channel_id BIGINT,
+            message_id BIGINT PRIMARY KEY,
             title TEXT,
             description TEXT
         );
         CREATE TABLE IF NOT EXISTS rr_buttons (
-            message_id INTEGER,
-            role_id INTEGER,
+            message_id BIGINT,
+            role_id BIGINT,
             emoji TEXT,
             label TEXT,
             PRIMARY KEY (message_id, role_id)
         );
         CREATE TABLE IF NOT EXISTS selfrole_reactions (
-            guild_id   INTEGER,
-            message_id INTEGER,
+            guild_id   BIGINT,
+            message_id BIGINT,
             emoji      TEXT,
-            role_id    INTEGER,
+            role_id    BIGINT,
             PRIMARY KEY (message_id, emoji)
         );
         CREATE TABLE IF NOT EXISTS staff_daily_channels (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS selfrole_panels (
-            guild_id   INTEGER,
-            message_id INTEGER PRIMARY KEY,
-            channel_id INTEGER,
+            guild_id   BIGINT,
+            message_id BIGINT PRIMARY KEY,
+            channel_id BIGINT,
             title      TEXT
         );
         CREATE TABLE IF NOT EXISTS boost_channels (
-            guild_id   INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id   BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS staff_done_log (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id     INTEGER,
-            user_id      INTEGER,
+            id           BIGSERIAL PRIMARY KEY,
+            guild_id     BIGINT,
+            user_id      BIGINT,
             display_name TEXT,
             done_at      TEXT
         );
         CREATE TABLE IF NOT EXISTS staff_done_role (
-            guild_id INTEGER PRIMARY KEY,
-            role_id  INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            role_id  BIGINT
         );
         CREATE TABLE IF NOT EXISTS reklam_settings (
-            guild_id   INTEGER PRIMARY KEY,
-            channel_id INTEGER,
-            role_id    INTEGER
+            guild_id   BIGINT PRIMARY KEY,
+            channel_id BIGINT,
+            role_id    BIGINT
         );
         CREATE TABLE IF NOT EXISTS done_log_channels (
-            guild_id   INTEGER PRIMARY KEY,
-            channel_id INTEGER
+            guild_id   BIGINT PRIMARY KEY,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS perk_settings (
-            guild_id          INTEGER PRIMARY KEY,
-            one_boost_role_id INTEGER,
-            two_boost_role_id INTEGER,
+            guild_id          BIGINT PRIMARY KEY,
+            one_boost_role_id BIGINT,
+            two_boost_role_id BIGINT,
             description       TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS welcome_embed_settings (
-            guild_id       INTEGER PRIMARY KEY,
+            guild_id       BIGINT PRIMARY KEY,
             title          TEXT,
             description    TEXT,
-            color          INTEGER,
+            color          BIGINT,
             image_url      TEXT,
             thumbnail_url  TEXT,
             invite_text    TEXT,
@@ -288,97 +375,97 @@ def init_db():
             channel_id     TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS autorole_settings (
-            guild_id INTEGER PRIMARY KEY,
-            role_id INTEGER
+            guild_id BIGINT PRIMARY KEY,
+            role_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS link_settings (
-            guild_id INTEGER PRIMARY KEY,
+            guild_id BIGINT PRIMARY KEY,
             label TEXT,
             url TEXT,
             alignment TEXT DEFAULT 'left'
         );
         CREATE TABLE IF NOT EXISTS tags (
-            guild_id    INTEGER,
+            guild_id    BIGINT,
             tag_name    TEXT,
             response    TEXT    DEFAULT '',
-            created_by  INTEGER DEFAULT 0,
+            created_by  BIGINT DEFAULT 0,
             PRIMARY KEY (guild_id, tag_name)
         );
         CREATE TABLE IF NOT EXISTS trivia_scores (
-            guild_id INTEGER,
-            user_id INTEGER,
-            score INTEGER DEFAULT 0,
+            guild_id BIGINT,
+            user_id BIGINT,
+            score BIGINT DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS guild_lang_settings (
-            guild_id INTEGER PRIMARY KEY,
+            guild_id BIGINT PRIMARY KEY,
             lang TEXT DEFAULT 'both'
         );
         CREATE TABLE IF NOT EXISTS staff_daily_roles (
-            guild_id INTEGER,
-            role_id INTEGER,
+            guild_id BIGINT,
+            role_id BIGINT,
             PRIMARY KEY (guild_id, role_id)
         );
         CREATE TABLE IF NOT EXISTS islam_settings (
-            guild_id   INTEGER PRIMARY KEY,
-            channel_id INTEGER,
-            role_id    INTEGER,
+            guild_id   BIGINT PRIMARY KEY,
+            channel_id BIGINT,
+            role_id    BIGINT,
             text_en    TEXT DEFAULT '',
             text_ku    TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS islam_last_msg (
-            guild_id   INTEGER PRIMARY KEY,
-            message_id INTEGER
+            guild_id   BIGINT PRIMARY KEY,
+            message_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS afk_settings (
-            guild_id   INTEGER PRIMARY KEY,
+            guild_id   BIGINT PRIMARY KEY,
             go_text    TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS staff_daily_text (
-            guild_id    INTEGER PRIMARY KEY,
+            guild_id    BIGINT PRIMARY KEY,
             title       TEXT DEFAULT '',
             description TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS antiswear_settings (
-            guild_id INTEGER PRIMARY KEY,
-            enabled  INTEGER DEFAULT 0
+            guild_id BIGINT PRIMARY KEY,
+            enabled  SMALLINT DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS antiswear_words (
-            guild_id INTEGER,
+            guild_id BIGINT,
             word     TEXT,
             PRIMARY KEY (guild_id, word)
         );
         CREATE TABLE IF NOT EXISTS antiswear_channels (
-            guild_id   INTEGER,
-            channel_id INTEGER,
+            guild_id   BIGINT,
+            channel_id BIGINT,
             PRIMARY KEY (guild_id, channel_id)
         );
         CREATE TABLE IF NOT EXISTS antilink_settings (
-            guild_id INTEGER PRIMARY KEY,
-            enabled  INTEGER DEFAULT 0
+            guild_id BIGINT PRIMARY KEY,
+            enabled  SMALLINT DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS antilink_channels (
-            guild_id   INTEGER,
-            channel_id INTEGER,
+            guild_id   BIGINT,
+            channel_id BIGINT,
             PRIMARY KEY (guild_id, channel_id)
         );
         CREATE TABLE IF NOT EXISTS staff_done_text (
-            guild_id    INTEGER PRIMARY KEY,
+            guild_id    BIGINT PRIMARY KEY,
             title       TEXT DEFAULT '',
             description TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS ticket_panel_text (
-            guild_id INTEGER PRIMARY KEY,
+            guild_id BIGINT PRIMARY KEY,
             text_en  TEXT DEFAULT '',
             text_ku  TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS verify_settings (
-            guild_id   INTEGER PRIMARY KEY,
-            role_id    INTEGER,
-            channel_id INTEGER
+            guild_id   BIGINT PRIMARY KEY,
+            role_id    BIGINT,
+            channel_id BIGINT
         );
         CREATE TABLE IF NOT EXISTS eventspeed_settings (
-            guild_id INTEGER PRIMARY KEY,
+            guild_id BIGINT PRIMARY KEY,
             text     TEXT DEFAULT '',
             role_ids TEXT DEFAULT ''
         );
@@ -392,14 +479,47 @@ init_db()
 def _migrate_db():
     conn = get_db()
     migrations = [
-        "ALTER TABLE welcome_embed_settings ADD COLUMN channel_id TEXT DEFAULT ''",
-        "ALTER TABLE perk_settings ADD COLUMN description TEXT DEFAULT ''",
-        "ALTER TABLE reklam_settings ADD COLUMN text TEXT DEFAULT ''",
+        "ALTER TABLE welcome_embed_settings ADD COLUMN IF NOT EXISTS channel_id TEXT DEFAULT ''",
+        "ALTER TABLE perk_settings ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
+        "ALTER TABLE reklam_settings ADD COLUMN IF NOT EXISTS text TEXT DEFAULT ''",
         """CREATE TABLE IF NOT EXISTS invite_custom_text (
-            guild_id INTEGER PRIMARY KEY,
+            guild_id BIGINT PRIMARY KEY,
             text TEXT DEFAULT ''
         )""",
-        "ALTER TABLE ticket_settings ADD COLUMN panel_message_id TEXT DEFAULT ''",
+        "ALTER TABLE ticket_settings ADD COLUMN IF NOT EXISTS panel_message_id TEXT DEFAULT ''",
+        """CREATE TABLE IF NOT EXISTS autoreact_emojis (
+            guild_id BIGINT,
+            emoji    TEXT,
+            PRIMARY KEY (guild_id, emoji)
+        )""",
+        """CREATE TABLE IF NOT EXISTS autoreact_channels (
+            guild_id   BIGINT,
+            channel_id BIGINT,
+            PRIMARY KEY (guild_id, channel_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS antiemoji_settings (
+            guild_id BIGINT PRIMARY KEY,
+            enabled  SMALLINT DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS antiemoji_emojis (
+            guild_id BIGINT,
+            emoji    TEXT,
+            PRIMARY KEY (guild_id, emoji)
+        )""",
+        """CREATE TABLE IF NOT EXISTS antiemoji_channels (
+            guild_id   BIGINT,
+            channel_id BIGINT,
+            PRIMARY KEY (guild_id, channel_id)
+        )""",
+
+        """CREATE TABLE IF NOT EXISTS warnings_log (
+            id           BIGSERIAL PRIMARY KEY,
+            guild_id     BIGINT,
+            user_id      BIGINT,
+            reason       TEXT    DEFAULT '',
+            moderator_id TEXT    DEFAULT '',
+            timestamp    BIGINT  DEFAULT 0
+        )""",
     ]
     for sql in migrations:
         try:
@@ -444,6 +564,57 @@ antilink_channels_map = {}  # {guild_id: set(channel_id, ...)}  — channels ant
 antiswear_guilds = {}  # {guild_id: True/False}  — anti-swear toggle per server
 antiswear_words_map = {}  # {guild_id: set(word, ...)}  — banned words per server
 antiswear_channels_map = {}  # {guild_id: set(channel_id, ...)}  — channels antiswear is scoped to (empty = all channels)
+_antiswear_regex_cache = {}  # {frozenset(words): compiled regex}  — avoids recompiling every message
+
+# ── AUTO-REACT globals ──────────────────────────────────────────────────────
+autoreact_emojis_map      = {}  # {guild_id_str: list[str]}  — emojis to react with
+autoreact_channels_map_ar = {}  # {guild_id_str: set(channel_id)}  — empty = all channels
+
+# ── ANTI-EMOJI globals ──────────────────────────────────────────────────────
+antiemoji_guilds       = {}  # {guild_id_str: bool}
+antiemoji_emojis_map   = {}  # {guild_id_str: set(str)}  — banned emoji strings
+antiemoji_channels_map = {}  # {guild_id_str: set(channel_id)}
+
+
+
+def _find_banned_word(content: str, banned_words) -> str | None:
+    """Return the first configured banned word/phrase found in `content`, or None.
+
+    Supports an unlimited number of banned words/phrases per guild (not just one).
+    Each entry is matched as a whole word/phrase (word-boundary aware) so short
+    entries like "ass" don't false-positive on "class", and multi-word phrases
+    like "bad word" are matched too. Matching is case-insensitive and also
+    catches the word with spaces/punctuation stripped out (e.g. "b a d" or
+    "b.a.d") to catch simple spacing/punctuation evasion.
+    """
+    if not content or not banned_words:
+        return None
+
+    words = tuple(sorted((w for w in banned_words if w and w.strip()), key=len, reverse=True))
+    if not words:
+        return None
+
+    key = words
+    pattern = _antiswear_regex_cache.get(key)
+    if pattern is None:
+        alternatives = "|".join(re.escape(w.lower()) for w in words)
+        pattern = re.compile(r"(?<![a-z0-9])(" + alternatives + r")(?![a-z0-9])", re.IGNORECASE)
+        _antiswear_regex_cache[key] = pattern
+
+    content_lower = content.lower()
+    match = pattern.search(content_lower)
+    if match:
+        return match.group(1)
+
+    # Fallback: catch words split up with spaces/punctuation (e.g. "b a d word").
+    stripped = re.sub(r"[\s\W]+", "", content_lower)
+    for w in words:
+        w_stripped = re.sub(r"[\s\W]+", "", w.lower())
+        if w_stripped and w_stripped in stripped:
+            return w
+    return None
+
+
 afk_go_text_map = {}  # {guild_id: custom "gone AFK" sentence template}
 staff_daily_text_map = {}  # {guild_id: {"title": str, "description": str}}
 staff_daily_channels = {}  # {guild_id: channel_id}  — where daily ping is sent
@@ -488,7 +659,7 @@ EIGHT_BALL_RESPONSES = [
     "Very doubtful. | زۆر گومانپێکراوە.",
 ]
 
-# --- SQLITE LOAD/SAVE FUNCTIONS ---
+# --- DATABASE LOAD/SAVE FUNCTIONS ---
 
 def load_xp():
     global xp_data
@@ -528,20 +699,45 @@ def load_warnings():
     warnings_data = {}
     conn = get_db()
     for row in conn.execute("SELECT guild_id, user_id, count FROM warnings"):
-        g = str(row["guild_id"])
-        u = str(row["user_id"])
-        warnings_data.setdefault(g, {})[u] = row["count"]
+        g, u = str(row["guild_id"]), str(row["user_id"])
+        warnings_data.setdefault(g, {}).setdefault(u, [])
+    try:
+        for row in conn.execute(
+            "SELECT guild_id, user_id, reason, moderator_id, timestamp "
+            "FROM warnings_log ORDER BY timestamp ASC"
+        ):
+            g, u = str(row["guild_id"]), str(row["user_id"])
+            warnings_data.setdefault(g, {}).setdefault(u, []).append({
+                "reason":    row["reason"]       or "",
+                "moderator": row["moderator_id"] or "",
+                "timestamp": row["timestamp"]    or 0,
+            })
+    except Exception:
+        pass  # table may not exist yet
     conn.close()
 
 def save_warnings():
     conn = get_db()
     for gid, users in warnings_data.items():
-        for uid, count in users.items():
+        for uid, warn_list in users.items():
+            count = len(warn_list) if isinstance(warn_list, list) else int(warn_list or 0)
             conn.execute(
                 "INSERT INTO warnings (guild_id, user_id, count) VALUES (?,?,?) "
                 "ON CONFLICT(guild_id, user_id) DO UPDATE SET count=excluded.count",
                 (int(gid), int(uid), count)
             )
+            if isinstance(warn_list, list):
+                conn.execute(
+                    "DELETE FROM warnings_log WHERE guild_id=? AND user_id=?",
+                    (int(gid), int(uid))
+                )
+                for w in warn_list:
+                    conn.execute(
+                        "INSERT INTO warnings_log (guild_id, user_id, reason, moderator_id, timestamp) "
+                        "VALUES (?,?,?,?,?)",
+                        (int(gid), int(uid),
+                         w.get("reason", ""), w.get("moderator", ""), w.get("timestamp", 0))
+                    )
     conn.commit()
     conn.close()
 
@@ -841,7 +1037,6 @@ def load_welcome_embed_settings():
             "image_url":    row["image_url"]    or "",
             "thumbnail_url":row["thumbnail_url"] or "avatar",
             "invite_text":  row["invite_text"]  or _WES_DEFAULTS["invite_text"],
-            "account_text": row["account_text"] or _WES_DEFAULTS["account_text"],
             "account_text": row["account_text"] or _WES_DEFAULTS["account_text"],
             "channel_id":   row["channel_id"]   if "channel_id" in row.keys() else "",
         }
@@ -1537,6 +1732,107 @@ def load_antiswear_settings():
         antiswear_channels_map.setdefault(str(row["guild_id"]), set()).add(row["channel_id"])
     conn.close()
 
+
+
+# ═══════════════ AUTO-REACT LOAD / SAVE ═══════════════
+
+def load_autoreact():
+    global autoreact_emojis_map, autoreact_channels_map_ar
+    autoreact_emojis_map = {}
+    autoreact_channels_map_ar = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, emoji FROM autoreact_emojis"):
+        autoreact_emojis_map.setdefault(str(row["guild_id"]), [])
+        autoreact_emojis_map[str(row["guild_id"])].append(row["emoji"])
+    for row in conn.execute("SELECT guild_id, channel_id FROM autoreact_channels"):
+        autoreact_channels_map_ar.setdefault(str(row["guild_id"]), set()).add(row["channel_id"])
+    conn.close()
+
+def save_autoreact_emojis(guild_id, emojis: list):
+    gid = str(guild_id)
+    autoreact_emojis_map[gid] = list(emojis)
+    conn = get_db()
+    conn.execute("DELETE FROM autoreact_emojis WHERE guild_id=?", (int(gid),))
+    for e in emojis:
+        conn.execute("INSERT OR IGNORE INTO autoreact_emojis (guild_id, emoji) VALUES (?,?)", (int(gid), e))
+    conn.commit()
+    conn.close()
+
+def toggle_autoreact_channel(guild_id, channel_id) -> bool:
+    """Add/remove channel from auto-react scope. Returns True if now active there."""
+    gid = str(guild_id)
+    chans = autoreact_channels_map_ar.setdefault(gid, set())
+    conn = get_db()
+    if channel_id in chans:
+        chans.discard(channel_id)
+        conn.execute("DELETE FROM autoreact_channels WHERE guild_id=? AND channel_id=?", (int(gid), int(channel_id)))
+        conn.commit()
+        conn.close()
+        return False
+    else:
+        chans.add(channel_id)
+        conn.execute("INSERT OR IGNORE INTO autoreact_channels (guild_id, channel_id) VALUES (?,?)", (int(gid), int(channel_id)))
+        conn.commit()
+        conn.close()
+        return True
+
+# ═══════════════ ANTI-EMOJI LOAD / SAVE ═══════════════
+
+def load_antiemoji():
+    global antiemoji_guilds, antiemoji_emojis_map, antiemoji_channels_map
+    antiemoji_guilds = {}
+    antiemoji_emojis_map = {}
+    antiemoji_channels_map = {}
+    conn = get_db()
+    for row in conn.execute("SELECT guild_id, enabled FROM antiemoji_settings"):
+        antiemoji_guilds[str(row["guild_id"])] = bool(row["enabled"])
+    for row in conn.execute("SELECT guild_id, emoji FROM antiemoji_emojis"):
+        antiemoji_emojis_map.setdefault(str(row["guild_id"]), set()).add(row["emoji"])
+    for row in conn.execute("SELECT guild_id, channel_id FROM antiemoji_channels"):
+        antiemoji_channels_map.setdefault(str(row["guild_id"]), set()).add(row["channel_id"])
+    conn.close()
+
+def save_antiemoji_enabled(guild_id, enabled: bool):
+    gid = str(guild_id)
+    antiemoji_guilds[gid] = enabled
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO antiemoji_settings (guild_id, enabled) VALUES (?,?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET enabled=excluded.enabled",
+        (int(gid), int(enabled))
+    )
+    conn.commit()
+    conn.close()
+
+def save_antiemoji_emojis(guild_id, emojis):
+    gid = str(guild_id)
+    clean = set(str(e).strip() for e in emojis if str(e).strip())
+    antiemoji_emojis_map[gid] = clean
+    conn = get_db()
+    conn.execute("DELETE FROM antiemoji_emojis WHERE guild_id=?", (int(gid),))
+    for e in clean:
+        conn.execute("INSERT OR IGNORE INTO antiemoji_emojis (guild_id, emoji) VALUES (?,?)", (int(gid), e))
+    conn.commit()
+    conn.close()
+
+def toggle_antiemoji_channel(guild_id, channel_id) -> bool:
+    """Add/remove channel from anti-emoji scope. Returns True if now active there."""
+    gid = str(guild_id)
+    chans = antiemoji_channels_map.setdefault(gid, set())
+    conn = get_db()
+    if channel_id in chans:
+        chans.discard(channel_id)
+        conn.execute("DELETE FROM antiemoji_channels WHERE guild_id=? AND channel_id=?", (int(gid), int(channel_id)))
+        conn.commit()
+        conn.close()
+        return False
+    else:
+        chans.add(channel_id)
+        conn.execute("INSERT OR IGNORE INTO antiemoji_channels (guild_id, channel_id) VALUES (?,?)", (int(gid), int(channel_id)))
+        conn.commit()
+        conn.close()
+        return True
+
 def save_antiswear_enabled(guild_id, enabled: bool):
     gid = str(guild_id)
     antiswear_guilds[gid] = enabled
@@ -1698,7 +1994,7 @@ def load_selfrole():
 def _save_selfrole_panel(guild_id, message_id, channel_id, title):
     conn = get_db()
     conn.execute(
-        "INSERT OR REPLACE INTO selfrole_panels (guild_id, message_id, channel_id, title) VALUES (?,?,?,?)",
+        "INSERT INTO selfrole_panels (guild_id, message_id, channel_id, title) VALUES (%s,%s,%s,%s) ON CONFLICT (message_id) DO UPDATE SET guild_id=EXCLUDED.guild_id, channel_id=EXCLUDED.channel_id, title=EXCLUDED.title",
         (guild_id, message_id, channel_id, title)
     )
     conn.commit()
@@ -1707,7 +2003,7 @@ def _save_selfrole_panel(guild_id, message_id, channel_id, title):
 def _save_selfrole_entry(guild_id, message_id, emoji, role_id):
     conn = get_db()
     conn.execute(
-        "INSERT OR REPLACE INTO selfrole_reactions (guild_id, message_id, emoji, role_id) VALUES (?,?,?,?)",
+        "INSERT INTO selfrole_reactions (guild_id, message_id, emoji, role_id) VALUES (%s,%s,%s,%s) ON CONFLICT (message_id, emoji) DO UPDATE SET guild_id=EXCLUDED.guild_id, role_id=EXCLUDED.role_id",
         (guild_id, message_id, emoji, role_id)
     )
     conn.commit()
@@ -1771,6 +2067,8 @@ load_afk_go_text()
 load_staff_daily_text()
 load_antilink_settings()
 load_antiswear_settings()
+load_autoreact()
+load_antiemoji()
 load_staff_done_text()
 load_ticket_panel_text()
 load_verify_settings()
@@ -1801,6 +2099,8 @@ async def on_ready():
     bot.add_view(IslamSetupView())
     bot.add_view(AntiSwearPanelView())
     bot.add_view(VerifyPanelView())
+    bot.add_view(AutoReactPanelView())
+    bot.add_view(AntiEmojiPanelView())
     for mid, buttons in list(rr_data.items()):
         if buttons:
             bot.add_view(ReactionRoleView(mid, buttons))
@@ -2000,8 +2300,7 @@ async def on_message(message):
         scoped_swear_channels = antiswear_channels_map.get(gid_str, set())
         in_swear_scope = (not scoped_swear_channels) or (message.channel.id in scoped_swear_channels)
         if banned_words and in_swear_scope:
-            content_lower = message.content.lower()
-            matched_word = next((w for w in banned_words if w and w in content_lower), None)
+            matched_word = _find_banned_word(message.content, banned_words)
             if matched_word:
                 has_exempt = any(
                     r.permissions.manage_messages or r.permissions.administrator
@@ -2026,6 +2325,71 @@ async def on_message(message):
                     except (discord.Forbidden, discord.HTTPException):
                         pass
                     return
+
+    # --- ANTI-EMOJI FILTER ---
+    if message.guild and antiemoji_guilds.get(str(message.guild.id)):
+        _ae_gid = str(message.guild.id)
+        _banned_emojis = antiemoji_emojis_map.get(_ae_gid, set())
+        _ae_scoped = antiemoji_channels_map.get(_ae_gid, set())
+        _ae_in_scope = (not _ae_scoped) or (message.channel.id in _ae_scoped)
+        if _banned_emojis and _ae_in_scope:
+            _content = message.content
+            _found_emoji = None
+            # Custom Discord emoji: <:name:id> or <a:name:id>
+            _custom_emojis_in_msg = re.findall(r'<a?:[^:]+:\d+>', _content)
+            for _ce in _custom_emojis_in_msg:
+                if _ce in _banned_emojis:
+                    _found_emoji = _ce
+                    break
+            # Unicode emoji / character check
+            if not _found_emoji:
+                for _char in _content:
+                    if _char in _banned_emojis:
+                        _found_emoji = _char
+                        break
+            if _found_emoji:
+                _ae_exempt = any(
+                    r.permissions.manage_messages or r.permissions.administrator
+                    for r in getattr(message.author, 'roles', [])
+                )
+                if not _ae_exempt:
+                    try:
+                        await message.delete()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    try:
+                        await message.channel.send(
+                            f"\u26d4 {message.author.mention} \u0626\u06d5\u0645 \u0626\u06cc\u0645\u06c6\u062c\u06cc\u06cc\u06d5 \u0642\u06d5\u062f\u06d5\u063a\u06d5\u06cc\u06d5! | "
+                            f"That emoji is banned here!",
+                            delete_after=5
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    return
+
+    # --- AUTO-REACT ---
+    if message.guild and not message.content.startswith(bot.command_prefix):
+        _ar_gid = str(message.guild.id)
+        _ar_emojis = autoreact_emojis_map.get(_ar_gid, [])
+        _ar_chans = autoreact_channels_map_ar.get(_ar_gid, set())
+        _ar_in_scope = (not _ar_chans) or (message.channel.id in _ar_chans)
+        if _ar_emojis and _ar_in_scope:
+            for _emoji_str in _ar_emojis:
+                try:
+                    _cm = re.match(r'<(a)?:([^:]+):(\d+)>', _emoji_str)
+                    if _cm:
+                        _partial = discord.PartialEmoji(
+                            animated=bool(_cm.group(1)),
+                            name=_cm.group(2),
+                            id=int(_cm.group(3))
+                        )
+                        await message.add_reaction(_partial)
+                    else:
+                        await message.add_reaction(_emoji_str)
+                except (discord.HTTPException, discord.Forbidden, discord.InvalidArgument):
+                    pass
+
+
 
     if message.guild is not None:
         # --- COOLER AFK SYSTEM: RETURN FROM AFK ---
@@ -2498,8 +2862,356 @@ async def on_message(message):
                 pass
         return
 
+    # --- NO-PREFIX tmo / untmo / nick SHORTCUTS ---
+    if message.guild is not None:
+        _np  = message.content.strip()
+        _np_lower = _np.lower()
+
+        # ── helper: permission check ─────────────────────────────────────────
+        def _mod_perm():
+            return (
+                message.channel.permissions_for(message.author).moderate_members
+                or message.channel.permissions_for(message.author).administrator
+            )
+        def _nick_perm():
+            return (
+                message.channel.permissions_for(message.author).manage_nicknames
+                or message.channel.permissions_for(message.author).administrator
+            )
+
+        # ── helper: resolve member from a raw token (mention or ID) ──────────
+        def _resolve_member(token: str):
+            mid = token.strip("<@!>")
+            if mid.isdigit():
+                return message.guild.get_member(int(mid))
+            return None
+
+        # ════════════════════════════════════════════════════════════════════
+        # tmo  — timeout shortcut
+        # ════════════════════════════════════════════════════════════════════
+        if _np_lower == "tmo" or _np_lower.startswith("tmo "):
+            # ── no args → show cool help embed ───────────────────────────────
+            if _np_lower == "tmo":
+                _e = discord.Embed(
+                    title="⏱️ Command: timeout",
+                    description="Timeout a member — prevents them from sending messages,\nadding reactions, or joining voice channels.",
+                    color=0xE67E22,
+                )
+                _e.add_field(
+                    name="Aliases",
+                    value="`!timeout`  `!tmo`  `tmo`",
+                    inline=False,
+                )
+                _e.add_field(
+                    name="Usage",
+                    value=(
+                        "`tmo @member`\n"
+                        "`tmo @member [minutes]`\n"
+                        "`tmo @member [minutes] [reason]`\n\n"
+                        "`!timeout @member [minutes] [reason]`\n"
+                        "`!tmo @member [minutes] [reason]`"
+                    ),
+                    inline=False,
+                )
+                _e.add_field(
+                    name="Examples",
+                    value=(
+                        "`tmo @B50`\n"
+                        "`tmo @B50 30`\n"
+                        "`tmo @B50 60 Spamming`\n"
+                        "`!tmo @B50 10 Breaking rules`"
+                    ),
+                    inline=False,
+                )
+                _e.set_footer(text="Default duration: 10 minutes  •  Max: 28 days (40320 min)")
+                await message.channel.send(embed=_e)
+                return
+
+            # ── has args → execute ────────────────────────────────────────────
+            if not _mod_perm():
+                await message.channel.send("❌ مووچەی Moderate Members پێویستە. | You need Moderate Members permission.")
+                return
+            _parts = _np.split(None, 3)
+            _tmo_member  = _resolve_member(_parts[1]) if len(_parts) >= 2 else None
+            _tmo_minutes = 10
+            _tmo_reason  = "No reason provided | هیچ هۆکارێک نەدراوە"
+            if _tmo_member is None:
+                _e2 = discord.Embed(
+                    description="❌ Member not found — mention or ID required.\n`tmo @member [minutes] [reason]`",
+                    color=0xE74C3C,
+                )
+                await message.channel.send(embed=_e2)
+                return
+            if len(_parts) >= 3 and _parts[2].isdigit():
+                _tmo_minutes = int(_parts[2])
+                if len(_parts) >= 4:
+                    _tmo_reason = _parts[3]
+            elif len(_parts) >= 3:
+                _tmo_reason = " ".join(_parts[2:])
+            if _tmo_minutes < 1 or _tmo_minutes > 40320:
+                await message.channel.send("❌ Duration must be 1–40320 minutes (28 days).")
+                return
+            _until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=_tmo_minutes)
+            try:
+                await _tmo_member.timeout(_until, reason=_tmo_reason)
+                _ok = discord.Embed(
+                    description=(
+                        f"⏱️ {_tmo_member.mention} بێدەنگ کرا بۆ **{_tmo_minutes}** خولەک.\n"
+                        f"⏱️ Timed out for **{_tmo_minutes}** minute(s).\n"
+                        f"📋 Reason: {_tmo_reason}"
+                    ),
+                    color=0xE67E22,
+                )
+                _ok.set_footer(text=f"By {message.author}")
+                await message.channel.send(embed=_ok)
+            except discord.Forbidden:
+                await message.channel.send("❌ I don't have permission to timeout that member.")
+            return
+
+        # ════════════════════════════════════════════════════════════════════
+        # untmo  — remove timeout shortcut
+        # ════════════════════════════════════════════════════════════════════
+        if _np_lower == "untmo" or _np_lower.startswith("untmo "):
+            # ── no args → show cool help embed ───────────────────────────────
+            if _np_lower == "untmo":
+                _e = discord.Embed(
+                    title="🔓 Command: untimeout",
+                    description="Remove an active timeout from a member,\nrestoring their ability to chat and join voice.",
+                    color=0x2ECC71,
+                )
+                _e.add_field(
+                    name="Aliases",
+                    value="`!untimeout`  `!untmo`  `untmo`",
+                    inline=False,
+                )
+                _e.add_field(
+                    name="Usage",
+                    value=(
+                        "`untmo @member`\n"
+                        "`!untimeout @member`\n"
+                        "`!untmo @member`"
+                    ),
+                    inline=False,
+                )
+                _e.add_field(
+                    name="Examples",
+                    value=(
+                        "`untmo @B50`\n"
+                        "`!untmo @B50`\n"
+                        "`!untimeout @B50`"
+                    ),
+                    inline=False,
+                )
+                _e.set_footer(text="Member must currently be timed out")
+                await message.channel.send(embed=_e)
+                return
+
+            # ── has args → execute ────────────────────────────────────────────
+            if not _mod_perm():
+                await message.channel.send("❌ مووچەی Moderate Members پێویستە. | You need Moderate Members permission.")
+                return
+            _parts2 = _np.split(None, 2)
+            _untmo_member = _resolve_member(_parts2[1]) if len(_parts2) >= 2 else None
+            if _untmo_member is None:
+                _e2 = discord.Embed(
+                    description="❌ Member not found — mention or ID required.\n`untmo @member`",
+                    color=0xE74C3C,
+                )
+                await message.channel.send(embed=_e2)
+                return
+            if _untmo_member.timed_out_until is None:
+                await message.channel.send(f"ℹ️ {_untmo_member.mention} isn't currently timed out. | بێدەنگ نەکراوە.")
+                return
+            try:
+                await _untmo_member.timeout(None, reason=f"Timeout removed by {message.author}")
+                _ok = discord.Embed(
+                    description=(
+                        f"✅ Timeout removed from {_untmo_member.mention}.\n"
+                        f"✅ بێدەنگیی {_untmo_member.mention} لادرا."
+                    ),
+                    color=0x2ECC71,
+                )
+                _ok.set_footer(text=f"By {message.author}")
+                await message.channel.send(embed=_ok)
+            except discord.Forbidden:
+                await message.channel.send("❌ I don't have permission to remove that timeout.")
+            return
+
+        # ════════════════════════════════════════════════════════════════════
+        # nick  — nickname shortcut (no prefix)
+        # ════════════════════════════════════════════════════════════════════
+        if _np_lower == "nick" or _np_lower.startswith("nick "):
+            # ── no args → show cool help embed ───────────────────────────────
+            if _np_lower == "nick":
+                _e = discord.Embed(
+                    title="✏️ Command: nickname",
+                    description="Change or reset a member's server nickname.",
+                    color=0x3498DB,
+                )
+                _e.add_field(
+                    name="Aliases",
+                    value="`!nickname`  `!nick`  `nick`",
+                    inline=False,
+                )
+                _e.add_field(
+                    name="Usage",
+                    value=(
+                        "`nick @member [new nickname]`\n"
+                        "`nick @member` — omit nickname to **reset**\n\n"
+                        "`!nickname @member [new nickname]`\n"
+                        "`!nick @member [new nickname]`"
+                    ),
+                    inline=False,
+                )
+                _e.add_field(
+                    name="Examples",
+                    value=(
+                        "`nick @B50 Cool Guy`\n"
+                        "`nick @B50` *(resets nickname)*\n"
+                        "`!nick @B50 VLT Leader`"
+                    ),
+                    inline=False,
+                )
+                _e.set_footer(text="Requires: Manage Nicknames permission")
+                await message.channel.send(embed=_e)
+                return
+
+            # ── has args → execute ────────────────────────────────────────────
+            if not _nick_perm():
+                await message.channel.send("❌ مووچەی Manage Nicknames پێویستە. | You need Manage Nicknames permission.")
+                return
+            _parts3 = _np.split(None, 2)
+            _nick_member = _resolve_member(_parts3[1]) if len(_parts3) >= 2 else None
+            if _nick_member is None:
+                _e2 = discord.Embed(
+                    description="❌ Member not found — mention or ID required.\n`nick @member [new nickname]`",
+                    color=0xE74C3C,
+                )
+                await message.channel.send(embed=_e2)
+                return
+            _new_nick = _parts3[2] if len(_parts3) >= 3 else None
+            try:
+                await _nick_member.edit(nick=_new_nick)
+                if _new_nick:
+                    _ok = discord.Embed(
+                        description=(
+                            f"✏️ {_nick_member.mention} — ناوی نمایشی گۆڕدرا بۆ **{_new_nick}**.\n"
+                            f"✏️ Nickname changed to **{_new_nick}**."
+                        ),
+                        color=0x3498DB,
+                    )
+                else:
+                    _ok = discord.Embed(
+                        description=(
+                            f"🔄 {_nick_member.mention} — ناوی نمایشی ڕێکخرایەوە.\n"
+                            f"🔄 Nickname has been reset."
+                        ),
+                        color=0x3498DB,
+                    )
+                _ok.set_footer(text=f"By {message.author}")
+                await message.channel.send(embed=_ok)
+            except discord.Forbidden:
+                await message.channel.send("❌ I don't have permission to change that member's nickname.")
+            return
+
     # --- PROCESS PREFIX COMMANDS (!command) ---
+    # ── TMO / UNTMO keyword: typed alone (no !) → show mod help embed ──────────
+    _cl = message.content.strip().lower()
+    if _cl in ("tmo", "untmo") and message.guild:
+        _e = discord.Embed(
+            color=0xED4245,
+            title="⚙️ Moderation Commands | فەرمانەکانی کونترۆڵ",
+            description=(
+                "تایپ کردنی **tmo** یان **untmo** بەتەنها ئەم لیستەت نیشان دەدات.\n"
+                "Typing **tmo** or **untmo** alone shows this list.\n"
+                "─────────────────────────────────"
+            ),
+        )
+        _e.add_field(
+            name="⏳  !timeout / !tmo",
+            value=(
+                "```\n!timeout @user [minutes] [reason]\n"
+                "!tmo @user 10 spamming\n```\n"
+                "دەبێدەنگ بکات ئەندامێک (خولەک، default 10).\n"
+                "Times out a member for X minutes."
+            ),
+            inline=False,
+        )
+        _e.add_field(
+            name="🔓  !untimeout / !untmo",
+            value=(
+                "```\n!untimeout @user\n"
+                "!untmo @user\n```\n"
+                "تایم‌ئاوت لابردنەوە.\n"
+                "Removes a timeout from a member."
+            ),
+            inline=False,
+        )
+        _e.add_field(
+            name="🏷️  !nickname / !nick",
+            value=(
+                "```\n!nick @user New Name\n"
+                "!nick @user        ← resets\n```\n"
+                "ناوی نمایشی ئەندامێک بگۆڕە یان ڕێکیبخستەوە.\n"
+                "Change or reset a member's nickname."
+            ),
+            inline=False,
+        )
+        _e.add_field(
+            name="🔨  !kick / !ban / !unban",
+            value=(
+                "```\n!kick @user [reason]\n"
+                "!ban  @user [reason]\n"
+                "!unban <user_id>\n```\n"
+                "لەدەرکردن، بانکردن، بانی کرێتەوە.\n"
+                "Kick, ban, or unban a member."
+            ),
+            inline=False,
+        )
+        _e.add_field(
+            name="⚠️  !warn / !warnings / !clearwarns",
+            value=(
+                "```\n!warn @user [reason]\n"
+                "!warnings @user\n"
+                "!clearwarns @user\n```\n"
+                "ئاگادارکردن، بینینی ئاگاداریەکان، سڕینەوەی ئاگاداریەکان.\n"
+                "Warn, view, or clear a member's warnings."
+            ),
+            inline=False,
+        )
+        _e.add_field(
+            name="🧹  !clear / !nuke / !lock / !unlock",
+            value=(
+                "```\n!clear 50\n"
+                "!nuke\n"
+                "!lock    !unlock\n```\n"
+                "پاکردنەوەی پەیامەکان، نووک، قفڵ/کردنەوەی کەناڵ.\n"
+                "Purge messages, nuke, or lock/unlock a channel."
+            ),
+            inline=False,
+        )
+        _e.add_field(
+            name="🚫  Filters | فیلتەرەکان",
+            value=(
+                "```\n!antiswear  /  !asw        ← word filter panel\n"
+                "!addword bad1, bad2, bad3   ← add multiple at once\n"
+                "!antiemoji  /  !ae          ← emoji filter panel\n"
+                "!addantiemoji 😂 🔥         ← ban emojis\n"
+                "!anti_link                  ← link filter toggle\n```\n"
+                "فیلتەری وشە، ئیموجی، و لینک.\n"
+                "Word, emoji, and link filters."
+            ),
+            inline=False,
+        )
+        _e.set_footer(text="💡 !tmo = !timeout  ·  !untmo = !untimeout  ·  !nick = !nickname  ·  Prefix: !")
+        try:
+            await message.channel.send(embed=_e)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return
+
     await bot.process_commands(message)
+
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -5762,14 +6474,21 @@ async def mute_error(ctx, error):
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("Usage: $mute @member [minutes] [reason] | بەکارهێنان: $mute @ئەندام [خولەک] [هۆکار]")
 
-@bot.command()
+@bot.command(aliases=["untimeout", "unmute_", "unt", "untmo"])
 @commands.has_permissions(moderate_members=True)
-async def unmute(ctx, member: discord.Member):
+async def unmute(ctx, member: discord.Member = None):
+    if member is None:
+        return await ctx.send("Usage: `!untimeout @member` (also works as `!unmute @member`) | بەکارهێنان: `!untimeout @ئەندام`")
+    if member.timed_out_until is None:
+        await ctx.send(f"{member.mention} isn't timed out. | {member.mention} بێدەنگ نەکراوە.")
+        return
     try:
-        await member.timeout(None)
-        await ctx.send(f"Unmuted {member.mention}. | بێدەنگیی {member.mention} لادرا.")
+        await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
+        await ctx.send(f"Removed timeout from {member.mention}. | بێدەنگیی {member.mention} لادرا.")
     except discord.Forbidden:
         await ctx.send("I don't have permission to remove the timeout. | مووچەم نییە بێدەنگیەکە لابدەم.")
+    except discord.HTTPException as e:
+        await ctx.send(f"Failed to remove the timeout: {e} | نەتوانرا بێدەنگیەکە لابدرێت.")
 
 @unmute.error
 async def unmute_error(ctx, error):
@@ -5778,7 +6497,7 @@ async def unmute_error(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("Member not found. | ئەندام نەدۆزرایەوە.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Usage: $unmute @member | بەکارهێنان: $unmute @ئەندام")
+        await ctx.send("Usage: `!untimeout @member` | بەکارهێنان: `!untimeout @ئەندام`")
 
 @bot.command()
 @commands.has_permissions(kick_members=True)
@@ -6009,6 +6728,30 @@ async def rps(ctx, choice: str = None):
 sniped = {}       # {channel_id: {"content", "author", "author_avatar", "time"}}
 edit_sniped = {}  # {channel_id: {"before", "after", "author", "author_avatar", "time"}}
 number_games = {}
+HANGMAN_STAGES = [
+    "```\n  +---+\n  |   |\n      |\n      |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n      |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n  |   |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|   |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\\\  |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\\\  |\n /    |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\\\  |\n / \\\\  |\n      |\n=========```",
+]
+
+def render_hangman(game: dict) -> str:
+    wrong_count = len(game.get("wrong", set()))
+    stage   = HANGMAN_STAGES[min(wrong_count, 6)]
+    word    = game.get("word", "")
+    guessed = game.get("guessed", set())
+    display = " ".join(c if c in guessed else "_" for c in word)
+    wrong_letters = ", ".join(sorted(game.get("wrong", set()))) or "None"
+    return (
+        f"{stage}\n"
+        f"**وشە | Word:** `{display}`\n"
+        f"**هەڵەکان | Wrong:** {wrong_letters}\n"
+        f"**ژیانی ماوە | Lives left:** {6 - wrong_count}/6"
+    )
+
 hangman_games = {}
 lucky_games = {}
 race_lobbies = {}
@@ -8091,8 +8834,9 @@ HELP_CATEGORIES = [
         ("!warn @member [reason]",            "Warn a member | ئاگادار بکە"),
         ("!warnings @member",                 "View warnings | ئاگاداریەکان ببینە"),
         ("!clearwarns @member",               "Clear warnings | ئاگاداریەکان بسڕەوە"),
-        ("!timeout @member <minutes>",        "Timeout a member | تایم‌ئاوت بکە"),
-        ("!nickname @member <name>",          "Change nickname | پشکنامە بگۆڕە"),
+        ("!timeout / !tmo / tmo @member <min>", "Timeout a member | تایم‌ئاوت بکە"),
+        ("!untimeout / !untmo / untmo @member","Remove timeout | تایم‌ئاوت لابدە"),
+        ("!nickname / !nick / nick @member",  "Change nickname | پشکنامە بگۆڕە"),
         ("!addrole @member @role",            "Add role to member | رۆڵ زیاد بکە"),
         ("!removerole @member @role",         "Remove role from member | رۆڵ لابدە"),
         ("!giverole @member @role",           "Give a role (admin) | رۆڵ ببەخشە"),
@@ -8110,8 +8854,14 @@ HELP_CATEGORIES = [
         ("!vcdisconnect @member",             "Disconnect from VC | لە VC دەرببە"),
         ("!anti_link",                        "Toggle anti-link filter | فیلتەری لینک چالاک/ناچالاک"),
         ("!setantilinkchannel [#channel]",    "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
-        ("!antiswear",                        "Toggle anti-swear filter + word panel | فیلتەری قسەی خراپ"),
+        ("!antiswear / !asw",                 "Anti-swear panel — add/remove unlimited words | پانێلی فیلتەری قسەی خراپ"),
+        ("!addword word1, word2, ...",         "Add multiple banned words at once | زیادکردنی وشەی قەدەغە"),
         ("!setantichannel [#channel]",        "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
+        ("!antiemoji / !ae",                  "Anti-emoji panel — ban unlimited emojis | پانێلی فیلتەری ئیموجی"),
+        ("!addantiemoji 😂 🔥 <:n:id>",       "Quick-add multiple banned emojis | زیادکردنی ئیموجی قەدەغە"),
+        ("!antiemojichannel / !aec [#ch]",    "Scope anti-emoji to specific channels | کەناڵی فیلتەری ئیموجی"),
+        ("!autoreacter / !ar",                "Auto-react panel — react to every message | پانێلی ئۆتۆ-ریاکت"),
+        ("!autoreactchannel / !arc [#ch]",    "Limit auto-react to a specific channel | کەناڵی ئۆتۆ-ریاکت"),
         ("!verify [#channel]",                "Set up / re-post the self-verification panel (admin) | دانانی پانێلی پشتڕاستکردنەوە"),
         ("!seteventspeed",                    "Configure Event Speed text + roles to ping (admin) | دانانی دەق و ڕۆڵی ئیڤێنت سپید"),
         ("!eventspeedpanel",                  "Post the Event Speed announcement (admin) | ناردنی ئیڤێنت سپید"),
@@ -8272,7 +9022,22 @@ PANEL_CATEGORIES = [
         ("!setdonelog #channel",                 "Staff done-log channel — NEEDS: #channel | چانێلی تۆمارکردنی کار — پێویست: #channel"),
         ("!anti_link",                           "Toggle anti-link filter (Manage Server) | فیلتەری لینک"),
         ("!setantilinkchannel [#channel]",       "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
-        ("!antiswear",                           "Toggle anti-swear filter + word panel (Manage Server) | فیلتەری قسەی خراپ"),
+        ("!antiswear / !asw",                    "Anti-swear panel — add/remove unlimited words | پانێلی فیلتەری قسەی خراپ"),
+        ("!addword word1, word2, ...",           "Add multiple banned words in one command | زیادکردنی وشەی قەدەغە"),
+        ("!setantichannel [#channel]",           "Scope anti-swear to a channel (toggle) | کەناڵی فیلتەری قسەی خراپ"),
+    ]),
+
+    ("🎉 Auto-React | ئۆتۆ-ریاکت", [
+        ("!autoreacter / !ar",                   "Open auto-react panel — set emojis to auto-react with | پانێلی ئۆتۆ-ریاکت"),
+        ("!autoreactchannel / !arc [#ch]",       "Limit auto-react to a channel (toggle) | کەناڵی ئۆتۆ-ریاکت"),
+    ]),
+
+    ("🚫 Anti-Emoji | فیلتەری ئیموجی", [
+        ("!antiemoji / !ae",                     "Open anti-emoji panel — ban unlimited emojis | پانێلی فیلتەری ئیموجی"),
+        ("!addantiemoji 😂 🔥 <:name:id>",       "Quick-add multiple banned emojis via command | زیادکردنی ئیموجی قەدەغە"),
+        ("!removeantiemoji 😂",                  "Remove a specific banned emoji | سڕینەوەی ئیموجی قەدەغە"),
+        ("!listantiemoji",                       "List all currently banned emojis | لیستی ئیموجیە قەدەغەکراوەکان"),
+        ("!antiemojichannel / !aec [#ch]",       "Scope anti-emoji enforcement to a channel | کەناڵی فیلتەری ئیموجی"),
         ("!setantichannel [#channel]",           "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
         ("!verify [#channel]",                   "Set up / re-post the self-verification panel | دانانی پانێلی پشتڕاستکردنەوە"),
         ("!setupstaffdaily",                     "Pick roles pinged by auto staff daily (6 PM Iraq time) + Edit Text button | رۆڵی پینگی دەیلی ستاف و دەقی دیاری بکە"),
@@ -11911,96 +12676,232 @@ async def setantilinkchannel_error(ctx, error):
 
 # ═══════════════ ANTI-SWEAR FILTER ═══════════════
 
-class AntiSwearWordsModal(discord.ui.Modal, title="📝 Anti-Swear Words"):
-    words_input = discord.ui.TextInput(
-        label="Banned words | وشەی قەدەغەکراو",
-        style=discord.TextStyle.paragraph,
-        placeholder="Separate words with commas or new lines...",
-        max_length=2000,
-        required=False,
-    )
+# ─── Anti-Swear: shared embed builder (tag-chip display) ──────────────────────
+def _antiswear_panel_embed(guild_id: str) -> discord.Embed:
+    gid = str(guild_id)
+    enabled = antiswear_guilds.get(gid, False)
+    words   = sorted(antiswear_words_map.get(gid, set()))
+    scoped  = antiswear_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped)
+                  if scoped else "All channels | هەموو کەناڵەکان")
+    color       = 0x57F287 if enabled else 0xED4245
+    status_text = "✅ Enabled | چالاک" if enabled else "❌ Disabled | ناچالاک"
 
-    def __init__(self, current_words: str = ""):
-        super().__init__()
-        self.words_input.default = current_words
+    # Build tag chips — group into lines so the field doesn't overflow
+    if words:
+        chips = [f"`{w}`" for w in words]
+        lines, line, line_len = [], [], 0
+        for chip in chips:
+            clen = len(chip) + 2
+            if line_len + clen > 58 and line:
+                lines.append("  ".join(line))
+                line, line_len = [chip], clen
+            else:
+                line.append(chip)
+                line_len += clen
+        if line:
+            lines.append("  ".join(line))
+        tag_display = "\n".join(lines)
+        if len(tag_display) > 1000:
+            tag_display = tag_display[:997] + "…"
+    else:
+        tag_display = "*No words banned yet*\n*Click **➕ Add Words** to start*"
+
+    embed = discord.Embed(
+        color=color,
+        title="🚫 Anti-Swear Filter | فیلتەری قسەی خراپ",
+    )
+    embed.add_field(name="Status | دۆخ",   value=status_text,      inline=True)
+    embed.add_field(name="Words | وشەکان", value=str(len(words)),   inline=True)
+    embed.add_field(name="Scope | کەناڵ",  value=scope_text,        inline=True)
+    embed.add_field(
+        name=f"🏷️  BAD WORDS  ({len(words)})",
+        value=tag_display,
+        inline=False,
+    )
+    embed.set_footer(text="➕ Add  •  ➖ Remove specific  •  🗑️ Clear all  •  🔄 Toggle on/off")
+    return embed
+
+
+# ─── Modal: Add words (appends to existing list) ──────────────────────────────
+class AntiSwearAddModal(discord.ui.Modal, title="➕ Add Banned Words"):
+    words_input = discord.ui.TextInput(
+        label="Words / phrases to ban",
+        style=discord.TextStyle.paragraph,
+        placeholder=(
+            "Type words separated by commas or new lines:\n"
+            "badword, another phrase, word3\n"
+            "word4\nword5"
+        ),
+        max_length=2000,
+        required=True,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         gid = str(interaction.guild.id) if interaction.guild else None
+        if not gid:
+            return await interaction.response.send_message("❌ Server only.", ephemeral=True)
         raw = self.words_input.value or ""
-        words = [w for chunk in raw.split("\n") for w in chunk.split(",")]
-        words = [w.strip() for w in words if w.strip()]
-        if gid:
-            save_antiswear_words(gid, words)
-            if words and not antiswear_guilds.get(gid, False):
-                save_antiswear_enabled(gid, True)
-        count = len(antiswear_words_map.get(gid, set())) if gid else 0
-        await interaction.response.send_message(
-            f"✅ وشەی قەدەغەکراو نوێکرایەوە ({count} وشە). | Banned word list updated ({count} word(s)).",
-            ephemeral=True,
+        new_words = [
+            w.strip()
+            for chunk in raw.replace("\n", ",").split(",")
+            for w in [chunk.strip()] if w.strip()
+        ]
+        if not new_words:
+            return await interaction.response.send_message(
+                "❌ No valid words found. | هیچ وشەیەکی دروست نەدۆزرایەوە.", ephemeral=True
+            )
+        current  = set(antiswear_words_map.get(gid, set()))
+        existing = {x.lower() for x in current}
+        added    = [w for w in new_words if w.lower() not in existing]
+        current.update(new_words)
+        save_antiswear_words(gid, current)
+        if not antiswear_guilds.get(gid, False):
+            save_antiswear_enabled(gid, True)
+        chips = "  ".join(f"`{w}`" for w in added[:20])
+        suffix = f" *(+{len(added) - 20} more)*" if len(added) > 20 else ""
+        notice = (
+            f"✅ Added **{len(added)}** new word(s): {chips}{suffix}"
+            if added else
+            "ℹ️ All those words were already in the list."
+        )
+        embed = _antiswear_panel_embed(gid)
+        await interaction.response.edit_message(
+            content=notice, embed=embed, view=AntiSwearPanelView()
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
-            await interaction.response.send_message(
-                "❌ هەڵەیەک ڕوویدا. | An error occurred.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
         except Exception:
             pass
 
 
+# ─── Ephemeral remove-select (one page = up to 25 words) ──────────────────────
+class AntiSwearRemoveView(discord.ui.View):
+    def __init__(self, guild_id: str, words: list, page: int = 0):
+        super().__init__(timeout=60)
+        self.gid   = guild_id
+        self.words = words
+        self.page  = page
+        self._build(words, page)
+
+    def _build(self, words, page):
+        start = page * 25
+        chunk = words[start : start + 25]
+        options = [discord.SelectOption(label=w[:100], value=w[:100]) for w in chunk]
+        sel = discord.ui.Select(
+            placeholder=f"Select words to remove  ({start+1}–{start+len(chunk)} of {len(words)})",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        sel.callback = self._on_select
+        self.add_item(sel)
+        # Prev / Next page buttons
+        if page > 0:
+            btn_prev = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1)
+            btn_prev.callback = self._prev
+            self.add_item(btn_prev)
+        if (page + 1) * 25 < len(words):
+            btn_next = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=1)
+            btn_next.callback = self._next
+            self.add_item(btn_next)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        chosen  = set(interaction.data["values"])
+        current = set(antiswear_words_map.get(self.gid, set()))
+        current -= chosen
+        save_antiswear_words(self.gid, current)
+        chips = "  ".join(f"`{w}`" for w in sorted(chosen))
+        await interaction.response.edit_message(
+            content=f"✅ Removed **{len(chosen)}** word(s): {chips}", view=None
+        )
+
+    async def _prev(self, interaction: discord.Interaction):
+        new_view = AntiSwearRemoveView(self.gid, self.words, self.page - 1)
+        await interaction.response.edit_message(view=new_view)
+
+    async def _next(self, interaction: discord.Interaction):
+        new_view = AntiSwearRemoveView(self.gid, self.words, self.page + 1)
+        await interaction.response.edit_message(view=new_view)
+
+
+# ─── Main persistent panel ────────────────────────────────────────────────────
 class AntiSwearPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="📝 Text Words | وشەکان",
-        style=discord.ButtonStyle.secondary,
-        custom_id="antiswear:words",
-        row=0,
-    )
-    async def text_words(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
+    def _can(self, interaction: discord.Interaction) -> bool:
+        p = interaction.user.guild_permissions
+        return p.administrator or p.manage_guild
+
+    @discord.ui.button(label="➕ Add Words", style=discord.ButtonStyle.success,
+                       custom_id="antiswear:add", row=0)
+    async def add_words(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can(interaction):
             return await interaction.response.send_message(
-                "❌ تەنها ئەدمین دەتوانێت وشەکان بگۆڕێت. | Only administrators can edit the word list.",
-                ephemeral=True,
-            )
-        gid = str(interaction.guild.id) if interaction.guild else ""
-        current = ", ".join(sorted(antiswear_words_map.get(gid, set())))
-        modal = AntiSwearWordsModal(current_words=current)
-        await interaction.response.send_modal(modal)
+                "❌ Manage Server permission required.", ephemeral=True)
+        await interaction.response.send_modal(AntiSwearAddModal())
+
+    @discord.ui.button(label="➖ Remove Words", style=discord.ButtonStyle.danger,
+                       custom_id="antiswear:remove", row=0)
+    async def remove_words(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can(interaction):
+            return await interaction.response.send_message(
+                "❌ Manage Server permission required.", ephemeral=True)
+        gid   = str(interaction.guild.id)
+        words = sorted(antiswear_words_map.get(gid, set()))
+        if not words:
+            return await interaction.response.send_message(
+                "ℹ️ No words to remove yet.", ephemeral=True)
+        await interaction.response.send_message(
+            "Select words to remove:", view=AntiSwearRemoveView(gid, words), ephemeral=True)
+
+    @discord.ui.button(label="🗑️ Clear All", style=discord.ButtonStyle.secondary,
+                       custom_id="antiswear:clear", row=0)
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can(interaction):
+            return await interaction.response.send_message(
+                "❌ Manage Server permission required.", ephemeral=True)
+        gid = str(interaction.guild.id)
+        save_antiswear_words(gid, set())
+        embed = _antiswear_panel_embed(gid)
+        await interaction.response.edit_message(
+            content="🗑️ Cleared all banned words.", embed=embed, view=AntiSwearPanelView())
+
+    @discord.ui.button(label="🔄 Toggle On/Off", style=discord.ButtonStyle.primary,
+                       custom_id="antiswear:toggle", row=1)
+    async def toggle_filter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can(interaction):
+            return await interaction.response.send_message(
+                "❌ Manage Server permission required.", ephemeral=True)
+        gid        = str(interaction.guild.id)
+        new_status = not antiswear_guilds.get(gid, False)
+        save_antiswear_enabled(gid, new_status)
+        embed  = _antiswear_panel_embed(gid)
+        status = "✅ Filter enabled" if new_status else "❌ Filter disabled"
+        await interaction.response.edit_message(
+            content=status, embed=embed, view=AntiSwearPanelView())
 
 
-@bot.command(name="antiswear", aliases=["anti_swear", "swearfilter"])
+@bot.command(name="antiswear", aliases=["anti_swear", "swearfilter", "asw", "wordfilter"])
 @commands.has_permissions(manage_guild=True)
 async def antiswear_cmd(ctx):
-    """Toggle the anti-swear filter and show the panel to manage its word list."""
+    """Toggle the anti-swear filter and show the tag-style word panel."""
     if ctx.guild is None:
         return await ctx.send("Server only. | تەنها لە سێرڤەر.")
-    gid = str(ctx.guild.id)
-    current = antiswear_guilds.get(gid, False)
-    status = not current
+    gid    = str(ctx.guild.id)
+    status = not antiswear_guilds.get(gid, False)
     save_antiswear_enabled(gid, status)
-    words = antiswear_words_map.get(gid, set())
-    scoped = antiswear_channels_map.get(gid, set())
-    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped
-                  else "هەموو کەناڵەکان | All channels")
-    color = 0x57F287 if status else 0xED4245
-    status_text = ("چالاک | Enabled" if status else "ناچالاک | Disabled")
-    embed = discord.Embed(
-        color=color,
-        title="🚫 فیلتەری قسەی خراپ | Anti-Swear Filter",
-        description=(
-            f"**دۆخ | Status:** {status_text}\n"
-            f"**ژمارەی وشەکان | Words configured:** {len(words)}\n"
-            f"**کەناڵەکان | Scoped channels:** {scope_text}\n\n"
-            "پەیامی کۆنترۆڵکراو دەسڕدرێتەوە و ناردەرەکەی بۆ ١ خولەک بێدەنگ دەکرێت.\n"
-            "Matched messages are deleted and the sender is timed out for 1 minute. "
-            "Staff with Manage Messages/Administrator are exempt.\n\n"
-            "Click **Text Words** below to set the banned words (any number, any words). "
-            "Use `!setantichannel #channel` to limit enforcement to specific channels."
-        ),
+    embed  = _antiswear_panel_embed(gid)
+    embed.set_footer(
+        text=(
+            f"{'✅ Filter enabled' if status else '❌ Filter disabled'}  •  "
+            f"By: {ctx.author.display_name}  •  "
+            "Use !setantichannel #channel to scope to specific channels"
+        )
     )
-    embed.set_footer(text=f"لەلایەن | By: {ctx.author.display_name}")
     await ctx.send(embed=embed, view=AntiSwearPanelView())
 
 @antiswear_cmd.error
@@ -12031,6 +12932,113 @@ async def setantichannel_cmd(ctx, channel: discord.TextChannel = None):
         description=f"{desc}\n\n**کەناڵی ئێستا | Current scope:** {scope_text}",
     )
     await ctx.send(embed=embed)
+
+
+@bot.command(name="addword", aliases=["addbannedword", "addswearword"])
+@commands.has_permissions(manage_guild=True)
+async def addword_cmd(ctx, *, words: str = None):
+    """Add one or more banned words/phrases. Separate multiple with commas.
+    Usage: !addword badword1, badword2, some phrase
+    """
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    if not words:
+        return await ctx.send(
+            "Usage: `!addword word1, word2, some phrase` (you can add as many as you want, comma-separated). | "
+            "بەکارهێنان: `!addword وشە١, وشە٢, ڕستەیەک`"
+        )
+    gid = str(ctx.guild.id)
+    new_words = [w.strip() for w in words.split(",") if w.strip()]
+    if not new_words:
+        return await ctx.send("No valid words found. | هیچ وشەیەکی دروست نەدۆزرایەوە.")
+    current = set(antiswear_words_map.get(gid, set()))
+    current.update(new_words)
+    save_antiswear_words(gid, current)
+    if not antiswear_guilds.get(gid, False):
+        save_antiswear_enabled(gid, True)
+    total = len(antiswear_words_map.get(gid, set()))
+    added_list = ", ".join(f"`{w}`" for w in new_words)
+    await ctx.send(
+        f"✅ Added {len(new_words)} word(s)/phrase(s): {added_list}\n"
+        f"Total banned words for this server: **{total}**. | "
+        f"وشە/ڕستە زیادکرا. کۆی گشتی: {total}"
+    )
+
+
+@addword_cmd.error
+async def addword_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="removeword", aliases=["removebannedword", "removeswearword", "delword"])
+@commands.has_permissions(manage_guild=True)
+async def removeword_cmd(ctx, *, words: str = None):
+    """Remove one or more banned words/phrases. Separate multiple with commas."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    if not words:
+        return await ctx.send("Usage: `!removeword word1, word2` | بەکارهێنان: `!removeword وشە١, وشە٢`")
+    gid = str(ctx.guild.id)
+    to_remove = {w.strip().lower() for w in words.split(",") if w.strip()}
+    current = set(antiswear_words_map.get(gid, set()))
+    removed = current & to_remove
+    current -= to_remove
+    save_antiswear_words(gid, current)
+    total = len(antiswear_words_map.get(gid, set()))
+    if removed:
+        removed_list = ", ".join(f"`{w}`" for w in sorted(removed))
+        await ctx.send(f"✅ Removed: {removed_list}\nRemaining banned words: **{total}**.")
+    else:
+        await ctx.send("None of those words were in the list. | هیچکام لەو وشەکان لە لیستەکەدا نەبوون.")
+
+
+@removeword_cmd.error
+async def removeword_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="listwords", aliases=["listbannedwords", "swearwords"])
+@commands.has_permissions(manage_guild=True)
+async def listwords_cmd(ctx):
+    """List every configured banned word/phrase for this server."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    words = sorted(antiswear_words_map.get(gid, set()))
+    if not words:
+        return await ctx.send("No banned words configured yet. Use `!addword word1, word2` to add some. | هیچ وشەیەک زیاد نەکراوە.")
+    listing = "\n".join(f"• {w}" for w in words)
+    embed = discord.Embed(
+        color=0x5865F2,
+        title=f"🚫 Banned Words ({len(words)})",
+        description=listing[:4000],
+    )
+    await ctx.send(embed=embed)
+
+
+@listwords_cmd.error
+async def listwords_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="clearwords", aliases=["clearbannedwords"])
+@commands.has_permissions(manage_guild=True)
+async def clearwords_cmd(ctx):
+    """Remove ALL configured banned words for this server."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    save_antiswear_words(gid, set())
+    await ctx.send("✅ Cleared the banned word list. | لیستەی وشەکان سڕایەوە.")
+
+
+@clearwords_cmd.error
+async def clearwords_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14377,6 +15385,424 @@ async def link_cmd(ctx):
 
 if not token:
     raise RuntimeError("No DISCORD_TOKEN found. Set it in your .env file or token.txt.")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── AUTO-REACTER COMMANDS ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AutoReactEmojiModal(discord.ui.Modal, title="🎉 Auto-React Emojis"):
+    emojis_input = discord.ui.TextInput(
+        label="Emojis (comma or newline separated)",
+        style=discord.TextStyle.paragraph,
+        placeholder="😂 👍 ❤️  or  <:custom:123456>  — add as many as you want!",
+        max_length=1000,
+        required=False,
+    )
+
+    def __init__(self, current: str = ""):
+        super().__init__()
+        self.emojis_input.default = current
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        raw = self.emojis_input.value or ""
+        tokens = [t.strip() for t in re.split(r'[,\n]+', raw) if t.strip()]
+        if gid:
+            save_autoreact_emojis(gid, tokens)
+        count = len(autoreact_emojis_map.get(gid, []))
+        await interaction.response.send_message(
+            f"✅ Auto-react emojis updated ({count} emoji(s)). | ئیموجیەکانی ئۆتۆ-ریاکت نوێکرایەوە.",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+        except Exception:
+            pass
+
+
+class AutoReactPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎨 Set Emojis | ئیموجیەکان دابنێ", style=discord.ButtonStyle.primary,
+                       custom_id="autoreact:setemojis", row=0)
+    async def set_emojis_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+        gid = str(interaction.guild.id)
+        current = " ".join(autoreact_emojis_map.get(gid, []))
+        await interaction.response.send_modal(AutoReactEmojiModal(current=current))
+
+    @discord.ui.button(label="🗑️ Clear All | هەموو سڕینەوە", style=discord.ButtonStyle.danger,
+                       custom_id="autoreact:clear", row=0)
+    async def clear_emojis_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+        gid = str(interaction.guild.id)
+        save_autoreact_emojis(gid, [])
+        await interaction.response.send_message(
+            "✅ Cleared all auto-react emojis. | هەموو ئیموجیەکان سڕایەوە.", ephemeral=True
+        )
+
+
+@bot.command(name="autoreacter", aliases=["autoreact", "auto_react", "ar", "reactpanel", "setreact"])
+@commands.has_permissions(manage_guild=True)
+async def autoreacter_cmd(ctx):
+    """Show the auto-reacter panel.
+    The bot will auto-react to every message with the emojis you set.
+    Works with Unicode emojis (😂 ❤️) AND custom server emojis (<:name:id>).
+    Use !autoreactchannel to limit to specific channels."""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    gid = str(ctx.guild.id)
+    emojis = autoreact_emojis_map.get(gid, [])
+    chans = autoreact_channels_map_ar.get(gid, set())
+    emoji_display = " ".join(emojis) if emojis else "_(none set yet)_"
+    scope_display = (", ".join(f"<#{c}>" for c in chans) if chans else "هەموو کەناڵەکان | All channels")
+    color = 0xFEE75C if emojis else 0x2B2D31
+    embed = discord.Embed(
+        color=color,
+        title="🎉 ئۆتۆ-ریاکتەر | Auto-Reacter",
+        description=(
+            f"**ئیموجیەکان | Emojis:** {emoji_display}\n"
+            f"**کەناڵەکان | Channels:** {scope_display}\n\n"
+            "**چۆن بەکاری بهێنیت | How to use:**\n"
+            "• Click **Set Emojis** to pick which emojis the bot reacts to every message with.\n"
+            "• Supports Unicode emojis (😂 ❤️ 👍) AND custom server emojis!\n"
+            "• You can set as many emojis as you want.\n"
+            "• Use `!autoreactchannel #channel` to limit to a specific channel.\n"
+            "• Run `!autoreactchannel #channel` again to remove it from the scope.\n\n"
+            "• کرتە بکە **Set Emojis** بۆ دیاریکردنی ئیموجیەکان.\n"
+            "• پشتگیری لە ئیموجی یەکینکۆد و ئیموجی تایبەتی سێرڤەر دەکات!\n"
+            "• دەتوانیت هەر چەندێک ئیموجی دابنێیت."
+        ),
+    )
+    await ctx.send(embed=embed, view=AutoReactPanelView())
+
+
+@autoreacter_cmd.error
+async def autoreacter_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission. | مووچەی بەڕێوەبردنی سێرڤەر پێویستە.")
+
+
+@bot.command(name="autoreactchannel", aliases=["autoreactch", "auto_react_channel", "arc", "reactchannel"])
+@commands.has_permissions(manage_guild=True)
+async def autoreactchannel_cmd(ctx, target: discord.TextChannel = None):
+    """Limit auto-react to a specific channel (toggle on/off).
+    If no channels are set, the bot reacts in ALL channels.
+    Usage: !autoreactchannel #general"""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    target = target or ctx.channel
+    gid = str(ctx.guild.id)
+    added = toggle_autoreact_channel(gid, target.id)
+    chans = autoreact_channels_map_ar.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in chans) if chans else "هەموو کەناڵەکان | All channels")
+    if added:
+        desc = (
+            f"✅ {target.mention} زیادکرا بۆ ئۆتۆ-ریاکت. | Added to auto-react scope.\n\n"
+            f"**ئێستا ریاکت دەکات لە | Now reacting in:** {scope_text}"
+        )
+        color = 0x57F287
+    else:
+        desc = (
+            f"➖ {target.mention} لابرا لە ئۆتۆ-ریاکت. | Removed from auto-react scope.\n\n"
+            f"**ئێستا ریاکت دەکات لە | Now reacting in:** {scope_text}"
+        )
+        color = 0xED4245
+    embed = discord.Embed(color=color, description=desc)
+    await ctx.send(embed=embed)
+
+
+@autoreactchannel_cmd.error
+async def autoreactchannel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission.")
+    elif isinstance(error, commands.ChannelNotFound):
+        await ctx.send("❌ Channel not found. | کەناڵ نەدۆزرایەوە.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── ANTI-EMOJI COMMANDS ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AntiEmojiModal(discord.ui.Modal, title="🚫 Banned Emojis"):
+    emojis_input = discord.ui.TextInput(
+        label="Banned emojis (comma or newline separated)",
+        style=discord.TextStyle.paragraph,
+        placeholder="😂 🔥 <:custom:123456> — add as many as you want!",
+        max_length=2000,
+        required=False,
+    )
+
+    def __init__(self, current: str = ""):
+        super().__init__()
+        self.emojis_input.default = current
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = str(interaction.guild.id) if interaction.guild else None
+        raw = self.emojis_input.value or ""
+        tokens = [t.strip() for t in re.split(r'[,\n]+', raw) if t.strip()]
+        if gid:
+            save_antiemoji_emojis(gid, tokens)
+            if tokens and not antiemoji_guilds.get(gid, False):
+                save_antiemoji_enabled(gid, True)
+        count = len(antiemoji_emojis_map.get(gid, set()))
+        await interaction.response.send_message(
+            f"✅ Banned emoji list updated ({count} emoji(s)). | لیستی ئیموجی قەدەغەکراو نوێکرایەوە.",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+        except Exception:
+            pass
+
+
+class AntiEmojiPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📝 Set Banned Emojis | دابنێ", style=discord.ButtonStyle.secondary,
+                       custom_id="antiemoji:set", row=0)
+    async def set_banned_emojis_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+        gid = str(interaction.guild.id)
+        current = "\n".join(sorted(antiemoji_emojis_map.get(gid, set())))
+        await interaction.response.send_modal(AntiEmojiModal(current=current))
+
+    @discord.ui.button(label="🗑️ Clear All | هەموو سڕینەوە", style=discord.ButtonStyle.danger,
+                       custom_id="antiemoji:clear", row=0)
+    async def clear_banned_emojis_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+        gid = str(interaction.guild.id)
+        save_antiemoji_emojis(gid, set())
+        await interaction.response.send_message(
+            "✅ Cleared all banned emojis. | هەموو ئیموجیە قەدەغەکراوەکان سڕایەوە.", ephemeral=True
+        )
+
+    @discord.ui.button(label="✅ Enable", style=discord.ButtonStyle.success,
+                       custom_id="antiemoji:enable", row=1)
+    async def enable_filter_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+        save_antiemoji_enabled(str(interaction.guild.id), True)
+        await interaction.response.send_message(
+            "✅ Anti-emoji filter **enabled**. | فیلتەری ئیموجی چالاک کرا.", ephemeral=True)
+
+    @discord.ui.button(label="❌ Disable", style=discord.ButtonStyle.danger,
+                       custom_id="antiemoji:disable", row=1)
+    async def disable_filter_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+        save_antiemoji_enabled(str(interaction.guild.id), False)
+        await interaction.response.send_message(
+            "❌ Anti-emoji filter **disabled**. | فیلتەری ئیموجی ناچالاک کرا.", ephemeral=True)
+
+
+@bot.command(name="antiemoji", aliases=["anti_emoji", "emojifilter", "ae", "emojiban"])
+@commands.has_permissions(manage_guild=True)
+async def antiemoji_cmd(ctx):
+    """Open the anti-emoji management panel (no auto-toggle).
+    Ban as many Unicode or custom emojis as you want.
+    Use Enable/Disable buttons inside the panel to toggle.
+    Use !antiemojichannel to scope to specific channels."""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    gid = str(ctx.guild.id)
+    status = antiemoji_guilds.get(gid, False)
+    emojis = antiemoji_emojis_map.get(gid, set())
+    scoped = antiemoji_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped else "هەموو کەناڵەکان | All channels")
+    color = 0x57F287 if status else 0x2B2D31
+    status_text = "چالاک ✅ | Enabled" if status else "ناچالاک ❌ | Disabled"
+    chips = "  ".join(sorted(emojis)[:30]) or "_هیچ نییە | none yet_"
+    embed = discord.Embed(color=color, title="🚫 فیلتەری ئیموجی | Anti-Emoji Filter")
+    embed.add_field(name="دۆخ | Status",   value=status_text,      inline=True)
+    embed.add_field(name="ژمارە | Count",  value=str(len(emojis)), inline=True)
+    embed.add_field(name="کەناڵ | Scope",  value=scope_text[:200], inline=True)
+    embed.add_field(
+        name=f"🏷️  BANNED EMOJIS ({len(emojis)})",
+        value=chips[:1000],
+        inline=False,
+    )
+    embed.add_field(
+        name="📌 How to use | چۆن",
+        value=(
+            "• **📝 Set Emojis** — add unlimited emojis via modal\n"
+            "• **🗑️ Clear All** — remove all banned emojis\n"
+            "• **✅ Enable / ❌ Disable** — toggle the filter\n"
+            "• `!addantiemoji 😂 🔥 <:name:id>` — quick-add via command\n"
+            "• `!antiemojichannel #ch` — limit to a specific channel"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="پەیامی ئیموجی قەدەغە ئۆتۆماتیکی دەسڕێتەوە | Banned-emoji messages are auto-deleted.")
+    await ctx.send(embed=embed, view=AntiEmojiPanelView())
+
+
+@antiemoji_cmd.error
+async def antiemoji_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission. | مووچەی بەڕێوەبردنی سێرڤەر پێویستە.")
+
+
+@bot.command(name="antiemojichannel", aliases=["antiemojicannel", "anti_emoji_channel", "aec", "emojibanch"])
+@commands.has_permissions(manage_guild=True)
+async def antiemojichannel_cmd(ctx, target: discord.TextChannel = None):
+    """Limit anti-emoji enforcement to a specific channel (toggle).
+    If no channels are set, enforced everywhere.
+    Usage: !antiemojichannel #general"""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    target = target or ctx.channel
+    gid = str(ctx.guild.id)
+    added = toggle_antiemoji_channel(gid, target.id)
+    scoped = antiemoji_channels_map.get(gid, set())
+    scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped else "هەموو کەناڵەکان | All channels")
+    if added:
+        desc = (
+            f"✅ {target.mention} زیادکرا بۆ فیلتەری ئیموجی. | Added to anti-emoji scope.\n\n"
+            f"**Scope:** {scope_text}"
+        )
+        color = 0x57F287
+    else:
+        desc = (
+            f"➖ {target.mention} لابرا لە فیلتەری ئیموجی. | Removed from anti-emoji scope.\n\n"
+            f"**Scope:** {scope_text}"
+        )
+        color = 0x99AAB5
+    embed = discord.Embed(color=color, description=desc)
+    await ctx.send(embed=embed)
+
+
+@antiemojichannel_cmd.error
+async def antiemojichannel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission.")
+    elif isinstance(error, commands.ChannelNotFound):
+        await ctx.send("❌ Channel not found. | کەناڵ نەدۆزرایەوە.")
+
+
+@bot.command(name="addantiemoji", aliases=["addbannedmoji", "banmoji", "bannemoji"])
+@commands.has_permissions(manage_guild=True)
+async def addantiemoji_cmd(ctx, *emojis):
+    """Add one or more emojis to the banned list — works with Unicode AND custom emojis.
+    Add as many as you want at once!
+    Usage: !addantiemoji 😂 🔥 <:custom:123456>"""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    if not emojis:
+        return await ctx.send(
+            "❌ Please provide at least one emoji.\n"
+            "Usage: !addantiemoji 😂 🔥 <:custom:123456>\n"
+            "تکایە لانیکەم یەک ئیموجی بنووسە."
+        )
+    gid = str(ctx.guild.id)
+    current = set(antiemoji_emojis_map.get(gid, set()))
+    added_list = []
+    for e in emojis:
+        e = e.strip()
+        if e:
+            current.add(e)
+            added_list.append(e)
+    save_antiemoji_emojis(gid, current)
+    if not antiemoji_guilds.get(gid, False):
+        save_antiemoji_enabled(gid, True)
+    total = len(antiemoji_emojis_map.get(gid, set()))
+    embed = discord.Embed(
+        color=0x57F287,
+        title="🚫 Banned Emojis Updated | ئیموجیە قەدەغەکراوەکان نوێکرایەوە",
+        description=(
+            f"**زیادکرا | Added:** {' '.join(added_list)}\n"
+            f"**کۆی قەدەغەکراوەکان | Total banned:** {total} emoji(s)\n\n"
+            "Anti-emoji filter is now **enabled**. | فیلتەری ئیموجی ئێستا **چالاکە**."
+        )
+    )
+    await ctx.send(embed=embed)
+
+
+@addantiemoji_cmd.error
+async def addantiemoji_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission.")
+
+
+@bot.command(name="removeantiemoji", aliases=["removebannedmoji", "unbanmoji", "unbanemoji"])
+@commands.has_permissions(manage_guild=True)
+async def removeantiemoji_cmd(ctx, *emojis):
+    """Remove one or more emojis from the banned list.
+    Usage: !removeantiemoji 😂 🔥"""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    if not emojis:
+        return await ctx.send("❌ Provide at least one emoji. Usage: !removeantiemoji 😂")
+    gid = str(ctx.guild.id)
+    current = set(antiemoji_emojis_map.get(gid, set()))
+    removed = []
+    not_found = []
+    for e in emojis:
+        e = e.strip()
+        if e in current:
+            current.discard(e)
+            removed.append(e)
+        else:
+            not_found.append(e)
+    save_antiemoji_emojis(gid, current)
+    total = len(antiemoji_emojis_map.get(gid, set()))
+    parts = []
+    if removed:
+        parts.append(f"**سڕایەوە | Removed:** {' '.join(removed)}")
+    if not_found:
+        parts.append(f"**نەدۆزرایەوە | Not in list:** {' '.join(not_found)}")
+    parts.append(f"**کۆی ماوەکان | Remaining:** {total}")
+    embed = discord.Embed(color=0x5865F2, title="🚫 Banned Emojis", description="\n".join(parts))
+    await ctx.send(embed=embed)
+
+
+@removeantiemoji_cmd.error
+async def removeantiemoji_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission.")
+
+
+@bot.command(name="listantiemoji", aliases=["listbannedmoji", "showbannedemojis"])
+@commands.has_permissions(manage_guild=True)
+async def listantiemoji_cmd(ctx):
+    """List all currently banned emojis for this server."""
+    if ctx.guild is None:
+        return await ctx.send("Server only.")
+    gid = str(ctx.guild.id)
+    emojis = sorted(antiemoji_emojis_map.get(gid, set()))
+    if not emojis:
+        return await ctx.send(
+            "No banned emojis yet. Use !addantiemoji 😂 🔥 to add some. | "
+            "هیچ ئیموجییەک قەدەغە نەکراوە."
+        )
+    listing = "  ".join(emojis)
+    status_txt = "چالاک ✅ | Enabled" if antiemoji_guilds.get(gid, False) else "ناچالاک ❌ | Disabled"
+    embed = discord.Embed(
+        color=0x5865F2,
+        title=f"🚫 ئیموجیە قەدەغەکراوەکان | Banned Emojis ({len(emojis)})",
+        description=listing[:4000],
+    )
+    embed.set_footer(text=f"Filter status: {status_txt}")
+    await ctx.send(embed=embed)
+
+
+@listantiemoji_cmd.error
+async def listantiemoji_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Manage Server permission.")
+
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
  
