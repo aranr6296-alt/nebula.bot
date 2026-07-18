@@ -698,9 +698,12 @@ def load_warnings():
     global warnings_data
     warnings_data = {}
     conn = get_db()
+    # Load legacy count-only rows first so guilds/users with no log entries still
+    # appear (their list will be empty, meaning their count was never detailed).
     for row in conn.execute("SELECT guild_id, user_id, count FROM warnings"):
         g, u = str(row["guild_id"]), str(row["user_id"])
         warnings_data.setdefault(g, {}).setdefault(u, [])
+    # Overlay the detailed log entries (reason + moderator + timestamp).
     try:
         for row in conn.execute(
             "SELECT guild_id, user_id, reason, moderator_id, timestamp "
@@ -708,18 +711,19 @@ def load_warnings():
         ):
             g, u = str(row["guild_id"]), str(row["user_id"])
             warnings_data.setdefault(g, {}).setdefault(u, []).append({
-                "reason":    row["reason"]       or "",
+                "reason":    row["reason"]    or "",
                 "moderator": row["moderator_id"] or "",
-                "timestamp": row["timestamp"]    or 0,
+                "timestamp": row["timestamp"] or 0,
             })
     except Exception:
-        pass  # table may not exist yet
+        pass  # warnings_log table may not exist on first run before migration
     conn.close()
 
 def save_warnings():
     conn = get_db()
     for gid, users in warnings_data.items():
         for uid, warn_list in users.items():
+            # warn_list is always a list-of-dicts; count is its length
             count = len(warn_list) if isinstance(warn_list, list) else int(warn_list or 0)
             conn.execute(
                 "INSERT INTO warnings (guild_id, user_id, count) VALUES (?,?,?) "
@@ -3115,103 +3119,7 @@ async def on_message(message):
             return
 
     # --- PROCESS PREFIX COMMANDS (!command) ---
-    # ── TMO / UNTMO keyword: typed alone (no !) → show mod help embed ──────────
-    _cl = message.content.strip().lower()
-    if _cl in ("tmo", "untmo") and message.guild:
-        _e = discord.Embed(
-            color=0xED4245,
-            title="⚙️ Moderation Commands | فەرمانەکانی کونترۆڵ",
-            description=(
-                "تایپ کردنی **tmo** یان **untmo** بەتەنها ئەم لیستەت نیشان دەدات.\n"
-                "Typing **tmo** or **untmo** alone shows this list.\n"
-                "─────────────────────────────────"
-            ),
-        )
-        _e.add_field(
-            name="⏳  !timeout / !tmo",
-            value=(
-                "```\n!timeout @user [minutes] [reason]\n"
-                "!tmo @user 10 spamming\n```\n"
-                "دەبێدەنگ بکات ئەندامێک (خولەک، default 10).\n"
-                "Times out a member for X minutes."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🔓  !untimeout / !untmo",
-            value=(
-                "```\n!untimeout @user\n"
-                "!untmo @user\n```\n"
-                "تایم‌ئاوت لابردنەوە.\n"
-                "Removes a timeout from a member."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🏷️  !nickname / !nick",
-            value=(
-                "```\n!nick @user New Name\n"
-                "!nick @user        ← resets\n```\n"
-                "ناوی نمایشی ئەندامێک بگۆڕە یان ڕێکیبخستەوە.\n"
-                "Change or reset a member's nickname."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🔨  !kick / !ban / !unban",
-            value=(
-                "```\n!kick @user [reason]\n"
-                "!ban  @user [reason]\n"
-                "!unban <user_id>\n```\n"
-                "لەدەرکردن، بانکردن، بانی کرێتەوە.\n"
-                "Kick, ban, or unban a member."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="⚠️  !warn / !warnings / !clearwarns",
-            value=(
-                "```\n!warn @user [reason]\n"
-                "!warnings @user\n"
-                "!clearwarns @user\n```\n"
-                "ئاگادارکردن، بینینی ئاگاداریەکان، سڕینەوەی ئاگاداریەکان.\n"
-                "Warn, view, or clear a member's warnings."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🧹  !clear / !nuke / !lock / !unlock",
-            value=(
-                "```\n!clear 50\n"
-                "!nuke\n"
-                "!lock    !unlock\n```\n"
-                "پاکردنەوەی پەیامەکان، نووک، قفڵ/کردنەوەی کەناڵ.\n"
-                "Purge messages, nuke, or lock/unlock a channel."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🚫  Filters | فیلتەرەکان",
-            value=(
-                "```\n!antiswear  /  !asw        ← word filter panel\n"
-                "!addword bad1, bad2, bad3   ← add multiple at once\n"
-                "!antiemoji  /  !ae          ← emoji filter panel\n"
-                "!addantiemoji 😂 🔥         ← ban emojis\n"
-                "!anti_link                  ← link filter toggle\n```\n"
-                "فیلتەری وشە، ئیموجی، و لینک.\n"
-                "Word, emoji, and link filters."
-            ),
-            inline=False,
-        )
-        _e.set_footer(text="💡 !tmo = !timeout  ·  !untmo = !untimeout  ·  !nick = !nickname  ·  Prefix: !")
-        try:
-            await message.channel.send(embed=_e)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        return
-
     await bot.process_commands(message)
-
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -6728,28 +6636,101 @@ async def rps(ctx, choice: str = None):
 sniped = {}       # {channel_id: {"content", "author", "author_avatar", "time"}}
 edit_sniped = {}  # {channel_id: {"before", "after", "author", "author_avatar", "time"}}
 number_games = {}
+# ── HANGMAN constants ───────────────────────────────────────────────────────
 HANGMAN_STAGES = [
-    "```\n  +---+\n  |   |\n      |\n      |\n      |\n      |\n=========```",
-    "```\n  +---+\n  |   |\n  O   |\n      |\n      |\n      |\n=========```",
-    "```\n  +---+\n  |   |\n  O   |\n  |   |\n      |\n      |\n=========```",
-    "```\n  +---+\n  |   |\n  O   |\n /|   |\n      |\n      |\n=========```",
-    "```\n  +---+\n  |   |\n  O   |\n /|\\\\  |\n      |\n      |\n=========```",
-    "```\n  +---+\n  |   |\n  O   |\n /|\\\\  |\n /    |\n      |\n=========```",
-    "```\n  +---+\n  |   |\n  O   |\n /|\\\\  |\n / \\\\  |\n      |\n=========```",
+    # 0 wrong guesses
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n      |"
+        "\n      |"
+        "\n      |"
+        "\n      |"
+        "\n=========```"
+    ),
+    # 1 wrong guess
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n  O   |"
+        "\n      |"
+        "\n      |"
+        "\n      |"
+        "\n=========```"
+    ),
+    # 2 wrong guesses
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n  O   |"
+        "\n  |   |"
+        "\n      |"
+        "\n      |"
+        "\n=========```"
+    ),
+    # 3 wrong guesses
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n  O   |"
+        "\n /|   |"
+        "\n      |"
+        "\n      |"
+        "\n=========```"
+    ),
+    # 4 wrong guesses
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n  O   |"
+        "\n /|\\  |"
+        "\n      |"
+        "\n      |"
+        "\n=========```"
+    ),
+    # 5 wrong guesses
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n  O   |"
+        "\n /|\\  |"
+        "\n /    |"
+        "\n      |"
+        "\n=========```"
+    ),
+    # 6 wrong guesses — game over
+    (
+        "```"
+        "\n  +---+"
+        "\n  |   |"
+        "\n  O   |"
+        "\n /|\\  |"
+        "\n / \\  |"
+        "\n      |"
+        "\n=========```"
+    ),
 ]
 
 def render_hangman(game: dict) -> str:
+    """Return a formatted string showing the current hangman state."""
     wrong_count = len(game.get("wrong", set()))
-    stage   = HANGMAN_STAGES[min(wrong_count, 6)]
-    word    = game.get("word", "")
+    stage = HANGMAN_STAGES[min(wrong_count, len(HANGMAN_STAGES) - 1)]
+    word = game.get("word", "")
     guessed = game.get("guessed", set())
     display = " ".join(c if c in guessed else "_" for c in word)
-    wrong_letters = ", ".join(sorted(game.get("wrong", set()))) or "None"
+    wrong_letters = ", ".join(sorted(game.get("wrong", set()))) or "None | هیچ"
+    lives_left = 6 - wrong_count
     return (
         f"{stage}\n"
         f"**وشە | Word:** `{display}`\n"
         f"**هەڵەکان | Wrong:** {wrong_letters}\n"
-        f"**ژیانی ماوە | Lives left:** {6 - wrong_count}/6"
+        f"**ژیانی ماوە | Lives left:** {lives_left}/6"
     )
 
 hangman_games = {}
@@ -8854,14 +8835,8 @@ HELP_CATEGORIES = [
         ("!vcdisconnect @member",             "Disconnect from VC | لە VC دەرببە"),
         ("!anti_link",                        "Toggle anti-link filter | فیلتەری لینک چالاک/ناچالاک"),
         ("!setantilinkchannel [#channel]",    "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
-        ("!antiswear / !asw",                 "Anti-swear panel — add/remove unlimited words | پانێلی فیلتەری قسەی خراپ"),
-        ("!addword word1, word2, ...",         "Add multiple banned words at once | زیادکردنی وشەی قەدەغە"),
+        ("!antiswear",                        "Toggle anti-swear filter + word panel | فیلتەری قسەی خراپ"),
         ("!setantichannel [#channel]",        "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
-        ("!antiemoji / !ae",                  "Anti-emoji panel — ban unlimited emojis | پانێلی فیلتەری ئیموجی"),
-        ("!addantiemoji 😂 🔥 <:n:id>",       "Quick-add multiple banned emojis | زیادکردنی ئیموجی قەدەغە"),
-        ("!antiemojichannel / !aec [#ch]",    "Scope anti-emoji to specific channels | کەناڵی فیلتەری ئیموجی"),
-        ("!autoreacter / !ar",                "Auto-react panel — react to every message | پانێلی ئۆتۆ-ریاکت"),
-        ("!autoreactchannel / !arc [#ch]",    "Limit auto-react to a specific channel | کەناڵی ئۆتۆ-ریاکت"),
         ("!verify [#channel]",                "Set up / re-post the self-verification panel (admin) | دانانی پانێلی پشتڕاستکردنەوە"),
         ("!seteventspeed",                    "Configure Event Speed text + roles to ping (admin) | دانانی دەق و ڕۆڵی ئیڤێنت سپید"),
         ("!eventspeedpanel",                  "Post the Event Speed announcement (admin) | ناردنی ئیڤێنت سپید"),
@@ -9022,22 +8997,7 @@ PANEL_CATEGORIES = [
         ("!setdonelog #channel",                 "Staff done-log channel — NEEDS: #channel | چانێلی تۆمارکردنی کار — پێویست: #channel"),
         ("!anti_link",                           "Toggle anti-link filter (Manage Server) | فیلتەری لینک"),
         ("!setantilinkchannel [#channel]",       "Scope anti-link to specific channels | کەناڵی فیلتەری لینک"),
-        ("!antiswear / !asw",                    "Anti-swear panel — add/remove unlimited words | پانێلی فیلتەری قسەی خراپ"),
-        ("!addword word1, word2, ...",           "Add multiple banned words in one command | زیادکردنی وشەی قەدەغە"),
-        ("!setantichannel [#channel]",           "Scope anti-swear to a channel (toggle) | کەناڵی فیلتەری قسەی خراپ"),
-    ]),
-
-    ("🎉 Auto-React | ئۆتۆ-ریاکت", [
-        ("!autoreacter / !ar",                   "Open auto-react panel — set emojis to auto-react with | پانێلی ئۆتۆ-ریاکت"),
-        ("!autoreactchannel / !arc [#ch]",       "Limit auto-react to a channel (toggle) | کەناڵی ئۆتۆ-ریاکت"),
-    ]),
-
-    ("🚫 Anti-Emoji | فیلتەری ئیموجی", [
-        ("!antiemoji / !ae",                     "Open anti-emoji panel — ban unlimited emojis | پانێلی فیلتەری ئیموجی"),
-        ("!addantiemoji 😂 🔥 <:name:id>",       "Quick-add multiple banned emojis via command | زیادکردنی ئیموجی قەدەغە"),
-        ("!removeantiemoji 😂",                  "Remove a specific banned emoji | سڕینەوەی ئیموجی قەدەغە"),
-        ("!listantiemoji",                       "List all currently banned emojis | لیستی ئیموجیە قەدەغەکراوەکان"),
-        ("!antiemojichannel / !aec [#ch]",       "Scope anti-emoji enforcement to a channel | کەناڵی فیلتەری ئیموجی"),
+        ("!antiswear",                           "Toggle anti-swear filter + word panel (Manage Server) | فیلتەری قسەی خراپ"),
         ("!setantichannel [#channel]",           "Scope anti-swear to specific channels | کەناڵی فیلتەری قسەی خراپ"),
         ("!verify [#channel]",                   "Set up / re-post the self-verification panel | دانانی پانێلی پشتڕاستکردنەوە"),
         ("!setupstaffdaily",                     "Pick roles pinged by auto staff daily (6 PM Iraq time) + Edit Text button | رۆڵی پینگی دەیلی ستاف و دەقی دیاری بکە"),
@@ -12885,7 +12845,7 @@ class AntiSwearPanelView(discord.ui.View):
             content=status, embed=embed, view=AntiSwearPanelView())
 
 
-@bot.command(name="antiswear", aliases=["anti_swear", "swearfilter", "asw", "wordfilter"])
+@bot.command(name="antiswear", aliases=["anti_swear", "swearfilter"])
 @commands.has_permissions(manage_guild=True)
 async def antiswear_cmd(ctx):
     """Toggle the anti-swear filter and show the tag-style word panel."""
@@ -15449,7 +15409,7 @@ class AutoReactPanelView(discord.ui.View):
         )
 
 
-@bot.command(name="autoreacter", aliases=["autoreact", "auto_react", "ar", "reactpanel", "setreact"])
+@bot.command(name="autoreacter", aliases=["autoreact", "auto_react"])
 @commands.has_permissions(manage_guild=True)
 async def autoreacter_cmd(ctx):
     """Show the auto-reacter panel.
@@ -15490,7 +15450,7 @@ async def autoreacter_error(ctx, error):
         await ctx.send("❌ You need Manage Server permission. | مووچەی بەڕێوەبردنی سێرڤەر پێویستە.")
 
 
-@bot.command(name="autoreactchannel", aliases=["autoreactch", "auto_react_channel", "arc", "reactchannel"])
+@bot.command(name="autoreactchannel", aliases=["autoreactch", "auto_react_channel"])
 @commands.has_permissions(manage_guild=True)
 async def autoreactchannel_cmd(ctx, target: discord.TextChannel = None):
     """Limit auto-react to a specific channel (toggle on/off).
@@ -15589,63 +15549,45 @@ class AntiEmojiPanelView(discord.ui.View):
             "✅ Cleared all banned emojis. | هەموو ئیموجیە قەدەغەکراوەکان سڕایەوە.", ephemeral=True
         )
 
-    @discord.ui.button(label="✅ Enable", style=discord.ButtonStyle.success,
-                       custom_id="antiemoji:enable", row=1)
-    async def enable_filter_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-        save_antiemoji_enabled(str(interaction.guild.id), True)
-        await interaction.response.send_message(
-            "✅ Anti-emoji filter **enabled**. | فیلتەری ئیموجی چالاک کرا.", ephemeral=True)
 
-    @discord.ui.button(label="❌ Disable", style=discord.ButtonStyle.danger,
-                       custom_id="antiemoji:disable", row=1)
-    async def disable_filter_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-        save_antiemoji_enabled(str(interaction.guild.id), False)
-        await interaction.response.send_message(
-            "❌ Anti-emoji filter **disabled**. | فیلتەری ئیموجی ناچالاک کرا.", ephemeral=True)
-
-
-@bot.command(name="antiemoji", aliases=["anti_emoji", "emojifilter", "ae", "emojiban"])
+@bot.command(name="antiemoji", aliases=["anti_emoji", "emojifilter"])
 @commands.has_permissions(manage_guild=True)
 async def antiemoji_cmd(ctx):
-    """Open the anti-emoji management panel (no auto-toggle).
+    """Toggle the anti-emoji filter and open the management panel.
     Ban as many Unicode or custom emojis as you want.
-    Use Enable/Disable buttons inside the panel to toggle.
-    Use !antiemojichannel to scope to specific channels."""
+    Messages containing banned emojis are automatically deleted.
+    Use !antiemojichannel to scope to specific channels.
+    Use !addantiemoji to add emojis via command.
+    Use !removeantiemoji to remove individual emojis."""
     if ctx.guild is None:
         return await ctx.send("Server only.")
     gid = str(ctx.guild.id)
-    status = antiemoji_guilds.get(gid, False)
+    current = antiemoji_guilds.get(gid, False)
+    status = not current
+    save_antiemoji_enabled(gid, status)
     emojis = antiemoji_emojis_map.get(gid, set())
     scoped = antiemoji_channels_map.get(gid, set())
     scope_text = (", ".join(f"<#{c}>" for c in scoped) if scoped else "هەموو کەناڵەکان | All channels")
-    color = 0x57F287 if status else 0x2B2D31
+    color = 0x57F287 if status else 0xED4245
     status_text = "چالاک ✅ | Enabled" if status else "ناچالاک ❌ | Disabled"
-    chips = "  ".join(sorted(emojis)[:30]) or "_هیچ نییە | none yet_"
-    embed = discord.Embed(color=color, title="🚫 فیلتەری ئیموجی | Anti-Emoji Filter")
-    embed.add_field(name="دۆخ | Status",   value=status_text,      inline=True)
-    embed.add_field(name="ژمارە | Count",  value=str(len(emojis)), inline=True)
-    embed.add_field(name="کەناڵ | Scope",  value=scope_text[:200], inline=True)
-    embed.add_field(
-        name=f"🏷️  BANNED EMOJIS ({len(emojis)})",
-        value=chips[:1000],
-        inline=False,
-    )
-    embed.add_field(
-        name="📌 How to use | چۆن",
-        value=(
-            "• **📝 Set Emojis** — add unlimited emojis via modal\n"
-            "• **🗑️ Clear All** — remove all banned emojis\n"
-            "• **✅ Enable / ❌ Disable** — toggle the filter\n"
-            "• `!addantiemoji 😂 🔥 <:name:id>` — quick-add via command\n"
-            "• `!antiemojichannel #ch` — limit to a specific channel"
+    emoji_preview = " ".join(sorted(emojis)[:20]) or "_(none set yet)_"
+    embed = discord.Embed(
+        color=color,
+        title="🚫 فیلتەری ئیموجی | Anti-Emoji Filter",
+        description=(
+            f"**دۆخ | Status:** {status_text}\n"
+            f"**ژمارەی قەدەغەکراوەکان | Banned emojis:** {len(emojis)}\n"
+            f"**کەناڵەکان | Scoped channels:** {scope_text}\n\n"
+            f"**ئیموجیە قەدەغەکراوەکان | Banned:** {emoji_preview}\n\n"
+            "**چۆن بەکاری بهێنیت | How to use:**\n"
+            "• **Set Banned Emojis** — open the panel, enter as many emojis as you want (unlimited!)\n"
+            "• `!addantiemoji 😂 🔥 <:name:id>` — quickly add multiple emojis via command\n"
+            "• `!removeantiemoji 😂` — remove a specific emoji\n"
+            "• `!listantiemoji` — see all banned emojis\n"
+            "• `!antiemojichannel #channel` — limit enforcement to a specific channel\n\n"
+            "وەقتێک ئیموجی قەدەغەیەک بەکاربهێنرا، پەیامەکە دەسڕێتەوە."
         ),
-        inline=False,
     )
-    embed.set_footer(text="پەیامی ئیموجی قەدەغە ئۆتۆماتیکی دەسڕێتەوە | Banned-emoji messages are auto-deleted.")
     await ctx.send(embed=embed, view=AntiEmojiPanelView())
 
 
@@ -15655,7 +15597,7 @@ async def antiemoji_error(ctx, error):
         await ctx.send("❌ You need Manage Server permission. | مووچەی بەڕێوەبردنی سێرڤەر پێویستە.")
 
 
-@bot.command(name="antiemojichannel", aliases=["antiemojicannel", "anti_emoji_channel", "aec", "emojibanch"])
+@bot.command(name="antiemojichannel", aliases=["antiemojicannel", "anti_emoji_channel"])
 @commands.has_permissions(manage_guild=True)
 async def antiemojichannel_cmd(ctx, target: discord.TextChannel = None):
     """Limit anti-emoji enforcement to a specific channel (toggle).
