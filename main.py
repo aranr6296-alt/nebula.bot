@@ -265,14 +265,6 @@ def init_db():
             guild_id   BIGINT PRIMARY KEY,
             message_id BIGINT
         );
-        CREATE TABLE IF NOT EXISTS warnings_log (
-            id           BIGSERIAL PRIMARY KEY,
-            guild_id     BIGINT,
-            user_id      BIGINT,
-            reason       TEXT    DEFAULT '',
-            moderator_id TEXT    DEFAULT '',
-            timestamp    BIGINT  DEFAULT 0
-        );
         CREATE TABLE IF NOT EXISTS invite_channels (
             guild_id BIGINT PRIMARY KEY,
             channel_id BIGINT
@@ -512,14 +504,6 @@ def _migrate_db():
             PRIMARY KEY (guild_id, channel_id)
         )""",
 
-        """CREATE TABLE IF NOT EXISTS warnings_log (
-            id           BIGSERIAL PRIMARY KEY,
-            guild_id     BIGINT,
-            user_id      BIGINT,
-            reason       TEXT    DEFAULT '',
-            moderator_id TEXT    DEFAULT '',
-            timestamp    BIGINT  DEFAULT 0
-        )""",
     ]
     for sql in migrations:
         try:
@@ -698,50 +682,21 @@ def load_warnings():
     global warnings_data
     warnings_data = {}
     conn = get_db()
-    # Load legacy count-only rows first so guilds/users with no log entries still
-    # appear (their list will be empty, meaning their count was never detailed).
     for row in conn.execute("SELECT guild_id, user_id, count FROM warnings"):
-        g, u = str(row["guild_id"]), str(row["user_id"])
-        warnings_data.setdefault(g, {}).setdefault(u, [])
-    # Overlay the detailed log entries (reason + moderator + timestamp).
-    try:
-        for row in conn.execute(
-            "SELECT guild_id, user_id, reason, moderator_id, timestamp "
-            "FROM warnings_log ORDER BY timestamp ASC"
-        ):
-            g, u = str(row["guild_id"]), str(row["user_id"])
-            warnings_data.setdefault(g, {}).setdefault(u, []).append({
-                "reason":    row["reason"]    or "",
-                "moderator": row["moderator_id"] or "",
-                "timestamp": row["timestamp"] or 0,
-            })
-    except Exception:
-        pass  # warnings_log table may not exist on first run before migration
+        g = str(row["guild_id"])
+        u = str(row["user_id"])
+        warnings_data.setdefault(g, {})[u] = row["count"]
     conn.close()
 
 def save_warnings():
     conn = get_db()
     for gid, users in warnings_data.items():
-        for uid, warn_list in users.items():
-            # warn_list is always a list-of-dicts; count is its length
-            count = len(warn_list) if isinstance(warn_list, list) else int(warn_list or 0)
+        for uid, count in users.items():
             conn.execute(
                 "INSERT INTO warnings (guild_id, user_id, count) VALUES (?,?,?) "
                 "ON CONFLICT(guild_id, user_id) DO UPDATE SET count=excluded.count",
                 (int(gid), int(uid), count)
             )
-            if isinstance(warn_list, list):
-                conn.execute(
-                    "DELETE FROM warnings_log WHERE guild_id=? AND user_id=?",
-                    (int(gid), int(uid))
-                )
-                for w in warn_list:
-                    conn.execute(
-                        "INSERT INTO warnings_log (guild_id, user_id, reason, moderator_id, timestamp) "
-                        "VALUES (?,?,?,?,?)",
-                        (int(gid), int(uid),
-                         w.get("reason", ""), w.get("moderator", ""), w.get("timestamp", 0))
-                    )
     conn.commit()
     conn.close()
 
@@ -1041,6 +996,7 @@ def load_welcome_embed_settings():
             "image_url":    row["image_url"]    or "",
             "thumbnail_url":row["thumbnail_url"] or "avatar",
             "invite_text":  row["invite_text"]  or _WES_DEFAULTS["invite_text"],
+            "account_text": row["account_text"] or _WES_DEFAULTS["account_text"],
             "account_text": row["account_text"] or _WES_DEFAULTS["account_text"],
             "channel_id":   row["channel_id"]   if "channel_id" in row.keys() else "",
         }
@@ -6636,103 +6592,6 @@ async def rps(ctx, choice: str = None):
 sniped = {}       # {channel_id: {"content", "author", "author_avatar", "time"}}
 edit_sniped = {}  # {channel_id: {"before", "after", "author", "author_avatar", "time"}}
 number_games = {}
-# ── HANGMAN constants ───────────────────────────────────────────────────────
-HANGMAN_STAGES = [
-    # 0 wrong guesses
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n      |"
-        "\n      |"
-        "\n      |"
-        "\n      |"
-        "\n=========```"
-    ),
-    # 1 wrong guess
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n  O   |"
-        "\n      |"
-        "\n      |"
-        "\n      |"
-        "\n=========```"
-    ),
-    # 2 wrong guesses
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n  O   |"
-        "\n  |   |"
-        "\n      |"
-        "\n      |"
-        "\n=========```"
-    ),
-    # 3 wrong guesses
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n  O   |"
-        "\n /|   |"
-        "\n      |"
-        "\n      |"
-        "\n=========```"
-    ),
-    # 4 wrong guesses
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n  O   |"
-        "\n /|\\  |"
-        "\n      |"
-        "\n      |"
-        "\n=========```"
-    ),
-    # 5 wrong guesses
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n  O   |"
-        "\n /|\\  |"
-        "\n /    |"
-        "\n      |"
-        "\n=========```"
-    ),
-    # 6 wrong guesses — game over
-    (
-        "```"
-        "\n  +---+"
-        "\n  |   |"
-        "\n  O   |"
-        "\n /|\\  |"
-        "\n / \\  |"
-        "\n      |"
-        "\n=========```"
-    ),
-]
-
-def render_hangman(game: dict) -> str:
-    """Return a formatted string showing the current hangman state."""
-    wrong_count = len(game.get("wrong", set()))
-    stage = HANGMAN_STAGES[min(wrong_count, len(HANGMAN_STAGES) - 1)]
-    word = game.get("word", "")
-    guessed = game.get("guessed", set())
-    display = " ".join(c if c in guessed else "_" for c in word)
-    wrong_letters = ", ".join(sorted(game.get("wrong", set()))) or "None | هیچ"
-    lives_left = 6 - wrong_count
-    return (
-        f"{stage}\n"
-        f"**وشە | Word:** `{display}`\n"
-        f"**هەڵەکان | Wrong:** {wrong_letters}\n"
-        f"**ژیانی ماوە | Lives left:** {lives_left}/6"
-    )
-
 hangman_games = {}
 lucky_games = {}
 race_lobbies = {}
