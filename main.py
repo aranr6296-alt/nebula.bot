@@ -86,16 +86,34 @@ def get_guild_lang(guild_id) -> str:
 def load_guild_langs():
     global guild_langs
     guild_langs = {}
-    conn = get_db()
-    for row in conn.execute("SELECT guild_id, lang FROM guild_lang_settings"):
-        guild_langs[str(row["guild_id"])] = row["lang"]
-    conn.close()
+    try:
+        conn = get_db()
+        for row in conn.execute("SELECT guild_id, lang FROM guild_lang_settings"):
+            guild_langs[str(row["guild_id"])] = row["lang"]
+        conn.close()
+    except Exception as _e:
+        logging.warning("load_guild_langs skipped (table may not exist yet): %s", _e)
 
 
 
 # --- POSTGRESQL DATABASE SETUP ---
-# Set DATABASE_URL in your Railway environment variables.
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Railway sets DATABASE_URL automatically when you add a PostgreSQL plugin.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    import sys as _sys
+    logging.critical(
+        "\n" + "=" * 60 + "\n"
+        "FATAL: DATABASE_URL is not set.\n"
+        "On Railway: project -> + New -> Database -> Add PostgreSQL.\n"
+        "Railway will inject DATABASE_URL automatically.\n"
+        "=" * 60
+    )
+    _sys.exit(1)
+
+# Ensure SSL for Railway managed Postgres (required).
+if "sslmode" not in DATABASE_URL and DATABASE_URL.startswith("postgres"):
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 
 import re as _re_pg  # used inside wrapper
 
@@ -123,11 +141,24 @@ class _PGCursor:
         return self._c.fetchall()
 
     def executescript(self, sql: str):
-        """Run multiple ;-separated statements (mirrors sqlite3 executescript)."""
+        """Run multiple ;-separated statements (mirrors sqlite3 executescript).
+        Each statement commits independently so one failure (e.g. table already
+        exists) does not abort the rest of the script.
+        """
         for stmt in sql.split(';'):
             s = stmt.strip()
-            if s:
+            if not s:
+                continue
+            try:
                 self._c.execute(s)
+                self._c.connection.commit()
+            except Exception as _exc:
+                try:
+                    self._c.connection.rollback()
+                except Exception:
+                    pass
+                if "already exists" not in str(_exc).lower():
+                    logging.warning("executescript stmt skipped (%s): %.80s", type(_exc).__name__, s)
 
     def execute(self, sql: str, params=()):
         self._c.execute(_pg_adapt_sql(sql), params or ())
@@ -144,8 +175,25 @@ class _PGWrapper:
     • commit() / close() / context-manager protocol
     """
     def __init__(self, dsn: str):
-        self._conn = psycopg2.connect(dsn)
-        self._conn.autocommit = False
+        import time as _t
+        last_exc = None
+        for _attempt in range(1, 6):
+            try:
+                self._conn = psycopg2.connect(
+                    dsn,
+                    connect_timeout=15,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5,
+                )
+                self._conn.autocommit = False
+                return
+            except psycopg2.OperationalError as _exc:
+                last_exc = _exc
+                logging.warning("DB connect attempt %d/5 failed: %s — retrying in %ds", _attempt, _exc, _attempt * 2)
+                _t.sleep(_attempt * 2)
+        raise last_exc
 
     def cursor(self) -> _PGCursor:
         return _PGCursor(self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor))
@@ -177,10 +225,18 @@ class _PGWrapper:
 
 
 def get_db() -> _PGWrapper:
-    return _PGWrapper(DATABASE_URL)
+    url = DATABASE_URL or os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add PostgreSQL in Railway and redeploy."
+        )
+    if "sslmode" not in url and url.startswith("postgres"):
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return _PGWrapper(url)
 
 def init_db():
     conn = get_db()
+    conn._conn.autocommit = True   # DDL must run outside a transaction on PG
     c = conn.cursor()
     c.executescript("""
         CREATE TABLE IF NOT EXISTS xp_data (
@@ -470,7 +526,6 @@ def init_db():
             role_ids TEXT DEFAULT ''
         );
     """)
-    conn.commit()
     conn.close()
 
 init_db()
@@ -478,6 +533,7 @@ init_db()
 # --- Migrate existing DBs: add columns added after initial release ---
 def _migrate_db():
     conn = get_db()
+    conn._conn.autocommit = True   # DDL migrations outside transaction
     migrations = [
         "ALTER TABLE welcome_embed_settings ADD COLUMN IF NOT EXISTS channel_id TEXT DEFAULT ''",
         "ALTER TABLE perk_settings ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
@@ -526,7 +582,6 @@ def _migrate_db():
             conn.execute(sql)
         except Exception:
             pass   # column already exists — safe to ignore
-    conn.commit()
     conn.close()
 _migrate_db()
 
