@@ -96,38 +96,48 @@ def load_guild_langs():
 
 
 
-# --- POSTGRESQL DATABASE SETUP ---
-# Railway sets DATABASE_URL automatically when you add a PostgreSQL plugin.
+# --- DATABASE SETUP (auto-detects PostgreSQL vs SQLite) ---
+# • Railway: add a PostgreSQL plugin — DATABASE_URL is set automatically.
+# • Local / no DATABASE_URL: falls back to SQLite file "bot_data.db".
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+_USE_POSTGRES = bool(DATABASE_URL)
 
-if not DATABASE_URL:
-    import sys as _sys
-    logging.critical(
-        "\n" + "=" * 60 + "\n"
-        "FATAL: DATABASE_URL is not set.\n"
-        "On Railway: project -> + New -> Database -> Add PostgreSQL.\n"
-        "Railway will inject DATABASE_URL automatically.\n"
-        "=" * 60
-    )
-    _sys.exit(1)
-
-# Ensure SSL for Railway managed Postgres (required).
-if "sslmode" not in DATABASE_URL and DATABASE_URL.startswith("postgres"):
+if _USE_POSTGRES and "sslmode" not in DATABASE_URL and DATABASE_URL.startswith("postgres"):
     DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 
-import re as _re_pg  # used inside wrapper
+import re as _re_pg       # used inside PG wrapper
+import sqlite3 as _sqlite3  # used inside SQLite wrapper
+
+
+# ── SQL normalisation helpers ────────────────────────────────────────────────
 
 def _pg_adapt_sql(sql: str) -> str:
-    """Convert SQLite-style SQL to PostgreSQL SQL at runtime."""
-    sql = sql.replace('?', '%s')
-    if _re_pg.search(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', sql, _re_pg.IGNORECASE):
-        sql = _re_pg.sub(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', 'INSERT INTO', sql, flags=_re_pg.IGNORECASE)
-        sql = sql.rstrip('; \n') + ' ON CONFLICT DO NOTHING'
+    """Convert SQLite-style SQL to PostgreSQL at runtime."""
+    sql = sql.replace("?", "%s")
+    if _re_pg.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", sql, _re_pg.IGNORECASE):
+        sql = _re_pg.sub(
+            r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", sql,
+            flags=_re_pg.IGNORECASE,
+        )
+        sql = sql.rstrip("; \n") + " ON CONFLICT DO NOTHING"
     return sql
 
 
+def _sqlite_adapt_sql(sql: str) -> str:
+    """Normalise PostgreSQL-isms so the SQL runs on SQLite."""
+    sql = _re_pg.sub(r"\bBIGSERIAL\b",         "INTEGER",  sql, flags=_re_pg.I)
+    sql = _re_pg.sub(r"\bBIGINT\b",             "INTEGER",  sql, flags=_re_pg.I)
+    sql = _re_pg.sub(r"\bSMALLINT\b",           "INTEGER",  sql, flags=_re_pg.I)
+    sql = _re_pg.sub(r"\bDOUBLE PRECISION\b",   "REAL",     sql, flags=_re_pg.I)
+    # SQLite < 3.37 has no "ADD COLUMN IF NOT EXISTS"
+    sql = _re_pg.sub(r"ADD COLUMN IF NOT EXISTS", "ADD COLUMN", sql, flags=_re_pg.I)
+    # PostgreSQL "ON CONFLICT DO NOTHING" is valid in SQLite 3.24+, keep it.
+    return sql
+
+
+# ── PostgreSQL cursor / wrapper ──────────────────────────────────────────────
+
 class _PGCursor:
-    """Wraps a psycopg2 RealDictCursor to behave like sqlite3's cursor."""
     def __init__(self, pg_cur):
         self._c = pg_cur
 
@@ -141,16 +151,12 @@ class _PGCursor:
         return self._c.fetchall()
 
     def executescript(self, sql: str):
-        """Run multiple ;-separated statements (mirrors sqlite3 executescript).
-        Each statement commits independently so one failure (e.g. table already
-        exists) does not abort the rest of the script.
-        """
-        for stmt in sql.split(';'):
+        for stmt in sql.split(";"):
             s = stmt.strip()
             if not s:
                 continue
             try:
-                self._c.execute(s)
+                self._c.execute(_pg_adapt_sql(s))
                 self._c.connection.commit()
             except Exception as _exc:
                 try:
@@ -158,7 +164,7 @@ class _PGCursor:
                 except Exception:
                     pass
                 if "already exists" not in str(_exc).lower():
-                    logging.warning("executescript stmt skipped (%s): %.80s", type(_exc).__name__, s)
+                    logging.warning("PG executescript skipped (%s): %.80s", type(_exc).__name__, s)
 
     def execute(self, sql: str, params=()):
         self._c.execute(_pg_adapt_sql(sql), params or ())
@@ -166,14 +172,6 @@ class _PGCursor:
 
 
 class _PGWrapper:
-    """Thin sqlite3-compatible wrapper around a psycopg2 connection.
-
-    Handles:
-    • ? → %s placeholder conversion
-    • INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
-    • Row access by column name (RealDictCursor)
-    • commit() / close() / context-manager protocol
-    """
     def __init__(self, dsn: str):
         import time as _t
         last_exc = None
@@ -191,7 +189,10 @@ class _PGWrapper:
                 return
             except psycopg2.OperationalError as _exc:
                 last_exc = _exc
-                logging.warning("DB connect attempt %d/5 failed: %s — retrying in %ds", _attempt, _exc, _attempt * 2)
+                logging.warning(
+                    "DB connect attempt %d/5 failed: %s — retrying in %ds",
+                    _attempt, _exc, _attempt * 2,
+                )
                 _t.sleep(_attempt * 2)
         raise last_exc
 
@@ -224,19 +225,91 @@ class _PGWrapper:
         self.close()
 
 
-def get_db() -> _PGWrapper:
-    url = DATABASE_URL or os.environ.get("DATABASE_URL", "").strip()
-    if not url:
-        raise RuntimeError(
-            "DATABASE_URL is not set. Add PostgreSQL in Railway and redeploy."
-        )
-    if "sslmode" not in url and url.startswith("postgres"):
-        url += ("&" if "?" in url else "?") + "sslmode=require"
-    return _PGWrapper(url)
+# ── SQLite cursor / wrapper (used when DATABASE_URL is not set) ──────────────
+
+class _SQLiteCursor:
+    def __init__(self, cur):
+        self._c = cur
+
+    def __iter__(self):
+        return iter(self._c.fetchall())
+
+    def fetchone(self):
+        return self._c.fetchone()
+
+    def fetchall(self):
+        return self._c.fetchall()
+
+    def executescript(self, sql: str):
+        for stmt in sql.split(";"):
+            s = stmt.strip()
+            if not s:
+                continue
+            try:
+                self._c.execute(_sqlite_adapt_sql(s))
+                self._c.connection.commit()
+            except Exception as _exc:
+                try:
+                    self._c.connection.rollback()
+                except Exception:
+                    pass
+                if "already exists" not in str(_exc).lower():
+                    logging.warning("SQLite executescript skipped (%s): %.80s", type(_exc).__name__, s)
+
+    def execute(self, sql: str, params=()):
+        self._c.execute(_sqlite_adapt_sql(sql), params or ())
+        return self
+
+
+class _SQLiteWrapper:
+    """sqlite3 connection with the same interface as _PGWrapper."""
+    def __init__(self, path: str = "bot_data.db"):
+        self._conn = _sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = _sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+
+    def cursor(self) -> _SQLiteCursor:
+        return _SQLiteCursor(self._conn.cursor())
+
+    def execute(self, sql: str, params=()):
+        cur = self._conn.cursor()
+        cur.execute(_sqlite_adapt_sql(sql), params or ())
+        return _SQLiteCursor(cur)
+
+    def executemany(self, sql: str, seq):
+        self._conn.executemany(_sqlite_adapt_sql(sql), seq)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+# ── Factory ─────────────────────────────────────────────────────────────────
+
+def get_db():
+    if _USE_POSTGRES:
+        url = DATABASE_URL
+        if "sslmode" not in url and url.startswith("postgres"):
+            url += ("&" if "?" in url else "?") + "sslmode=require"
+        return _PGWrapper(url)
+    return _SQLiteWrapper()
+
 
 def init_db():
     conn = get_db()
-    conn._conn.autocommit = True   # DDL must run outside a transaction on PG
+    if _USE_POSTGRES: conn._conn.autocommit = True  # DDL outside tx (PG only)
     c = conn.cursor()
     c.executescript("""
         CREATE TABLE IF NOT EXISTS xp_data (
@@ -533,7 +606,7 @@ init_db()
 # --- Migrate existing DBs: add columns added after initial release ---
 def _migrate_db():
     conn = get_db()
-    conn._conn.autocommit = True   # DDL migrations outside transaction
+    if _USE_POSTGRES: conn._conn.autocommit = True  # DDL outside tx (PG only)
     migrations = [
         "ALTER TABLE welcome_embed_settings ADD COLUMN IF NOT EXISTS channel_id TEXT DEFAULT ''",
         "ALTER TABLE perk_settings ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
