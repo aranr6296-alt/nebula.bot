@@ -2994,7 +2994,6 @@ async def on_message(message):
     if message.guild is not None:
         _np  = message.content.strip()
         _np_lower = _np.lower()
-
         # ── helper: permission check ─────────────────────────────────────────
         def _mod_perm():
             return (
@@ -3009,9 +3008,12 @@ async def on_message(message):
 
         # ── helper: resolve member from a raw token (mention or ID) ──────────
         def _resolve_member(token: str):
-            mid = token.strip("<@!>")
-            if mid.isdigit():
-                return message.guild.get_member(int(mid))
+            try:
+                mid = token.strip("<@!>")
+                if mid.isdigit():
+                    return message.guild.get_member(int(mid))
+            except Exception:
+                pass
             return None
 
         # ════════════════════════════════════════════════════════════════════
@@ -3094,6 +3096,8 @@ async def on_message(message):
                 await message.channel.send(embed=_ok)
             except discord.Forbidden:
                 await message.channel.send("❌ I don't have permission to timeout that member.")
+            except (discord.HTTPException, Exception) as _e_tmo:
+                await message.channel.send(f"❌ Error: {_e_tmo}")
             return
 
         # ════════════════════════════════════════════════════════════════════
@@ -3163,6 +3167,8 @@ async def on_message(message):
                 await message.channel.send(embed=_ok)
             except discord.Forbidden:
                 await message.channel.send("❌ I don't have permission to remove that timeout.")
+            except (discord.HTTPException, Exception) as _e_untmo:
+                await message.channel.send(f"❌ Error: {_e_untmo}")
             return
 
         # ════════════════════════════════════════════════════════════════════
@@ -3240,103 +3246,9 @@ async def on_message(message):
                 await message.channel.send(embed=_ok)
             except discord.Forbidden:
                 await message.channel.send("❌ I don't have permission to change that member's nickname.")
+            except (discord.HTTPException, Exception) as _e_nick:
+                await message.channel.send(f"❌ Error: {_e_nick}")
             return
-
-    # --- PROCESS PREFIX COMMANDS (!command) ---
-    # ── TMO / UNTMO keyword: typed alone (no !) → show mod help embed ──────────
-    _cl = message.content.strip().lower()
-    if _cl in ("tmo", "untmo") and message.guild:
-        _e = discord.Embed(
-            color=0xED4245,
-            title="⚙️ Moderation Commands | فەرمانەکانی کونترۆڵ",
-            description=(
-                "تایپ کردنی **tmo** یان **untmo** بەتەنها ئەم لیستەت نیشان دەدات.\n"
-                "Typing **tmo** or **untmo** alone shows this list.\n"
-                "─────────────────────────────────"
-            ),
-        )
-        _e.add_field(
-            name="⏳  !timeout / !tmo",
-            value=(
-                "```\n!timeout @user [minutes] [reason]\n"
-                "!tmo @user 10 spamming\n```\n"
-                "دەبێدەنگ بکات ئەندامێک (خولەک، default 10).\n"
-                "Times out a member for X minutes."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🔓  !untimeout / !untmo",
-            value=(
-                "```\n!untimeout @user\n"
-                "!untmo @user\n```\n"
-                "تایم‌ئاوت لابردنەوە.\n"
-                "Removes a timeout from a member."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🏷️  !nickname / !nick",
-            value=(
-                "```\n!nick @user New Name\n"
-                "!nick @user        ← resets\n```\n"
-                "ناوی نمایشی ئەندامێک بگۆڕە یان ڕێکیبخستەوە.\n"
-                "Change or reset a member's nickname."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🔨  !kick / !ban / !unban",
-            value=(
-                "```\n!kick @user [reason]\n"
-                "!ban  @user [reason]\n"
-                "!unban <user_id>\n```\n"
-                "لەدەرکردن، بانکردن، بانی کرێتەوە.\n"
-                "Kick, ban, or unban a member."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="⚠️  !warn / !warnings / !clearwarns",
-            value=(
-                "```\n!warn @user [reason]\n"
-                "!warnings @user\n"
-                "!clearwarns @user\n```\n"
-                "ئاگادارکردن، بینینی ئاگاداریەکان، سڕینەوەی ئاگاداریەکان.\n"
-                "Warn, view, or clear a member's warnings."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🧹  !clear / !nuke / !lock / !unlock",
-            value=(
-                "```\n!clear 50\n"
-                "!nuke\n"
-                "!lock    !unlock\n```\n"
-                "پاکردنەوەی پەیامەکان، نووک، قفڵ/کردنەوەی کەناڵ.\n"
-                "Purge messages, nuke, or lock/unlock a channel."
-            ),
-            inline=False,
-        )
-        _e.add_field(
-            name="🚫  Filters | فیلتەرەکان",
-            value=(
-                "```\n!antiswear  /  !asw        ← word filter panel\n"
-                "!addword bad1, bad2, bad3   ← add multiple at once\n"
-                "!antiemoji  /  !ae          ← emoji filter panel\n"
-                "!addantiemoji 😂 🔥         ← ban emojis\n"
-                "!anti_link                  ← link filter toggle\n```\n"
-                "فیلتەری وشە، ئیموجی، و لینک.\n"
-                "Word, emoji, and link filters."
-            ),
-            inline=False,
-        )
-        _e.set_footer(text="💡 !tmo = !timeout  ·  !untmo = !untimeout  ·  !nick = !nickname  ·  Prefix: !")
-        try:
-            await message.channel.send(embed=_e)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        return
 
     await bot.process_commands(message)
 
